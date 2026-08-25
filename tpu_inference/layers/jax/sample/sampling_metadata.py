@@ -58,6 +58,7 @@ class TPUSupportedSamplingMetadata:
         padded_num_reqs: int,
         req_indices_dp: dict,
         sharding: Optional[jax.sharding.Sharding] = None,
+        padded_num_reqs_per_dp_rank: Optional[int | list[int]] = None,
     ) -> "TPUSupportedSamplingMetadata":
         needs_logprobs = input_batch.max_num_logprobs > 0 if input_batch.max_num_logprobs else False
 
@@ -84,14 +85,23 @@ class TPUSupportedSamplingMetadata:
                                  dtype=cpu_tensor_np.dtype)
 
             dp_size = len(req_indices_dp)
-            assert padded_num_reqs % dp_size == 0, f"padded_num_reqs ({padded_num_reqs}) must be divisible by dp_size ({dp_size})"
-            padded_num_reqs_per_dp_rank = padded_num_reqs // dp_size
-            for dp_rank in range(dp_size):
-                req_indices = req_indices_dp.get(dp_rank, [])
-                if req_indices:
-                    start_idx = dp_rank * padded_num_reqs_per_dp_rank
-                    out_tensor[start_idx:start_idx +
-                               len(req_indices)] = cpu_tensor_np[req_indices]
+            if isinstance(padded_num_reqs_per_dp_rank, (list, tuple)):
+                offsets = [0] + list(np.cumsum(padded_num_reqs_per_dp_rank))
+                for dp_rank in range(dp_size):
+                    req_indices = req_indices_dp.get(dp_rank, [])
+                    if req_indices:
+                        start_idx = offsets[dp_rank]
+                        out_tensor[start_idx:start_idx +
+                                   len(req_indices)] = cpu_tensor_np[req_indices]
+            else:
+                per_dp = (padded_num_reqs_per_dp_rank if isinstance(padded_num_reqs_per_dp_rank, int)
+                          else (padded_num_reqs // dp_size if dp_size > 0 else padded_num_reqs))
+                for dp_rank in range(dp_size):
+                    req_indices = req_indices_dp.get(dp_rank, [])
+                    if req_indices:
+                        start_idx = dp_rank * per_dp
+                        out_tensor[start_idx:start_idx +
+                                   len(req_indices)] = cpu_tensor_np[req_indices]
 
             return out_tensor
 

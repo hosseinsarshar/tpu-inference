@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     TPU_WORKER_ID: str | None = None
     TPU_MULTIHOST_BACKEND: str = ""
     TPU_MULTIPROCESS_DP: bool | None = None
+    TPU_MESH_BASED_DP: bool = False
     PREFILL_SLICES: str = ""
     DECODE_SLICES: str = ""
     SKIP_JAX_PRECOMPILE: bool = False
@@ -238,6 +239,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and Pathways).
     "TPU_MULTIPROCESS_DP":
     env_bool("TPU_MULTIPROCESS_DP", default=None),
+    # Enable per-DP-rank independent meshes instead of a single 2D SPMD mesh
+    "TPU_MESH_BASED_DP":
+    env_bool("TPU_MESH_BASED_DP", default=False),
     # Slice configuration for disaggregated prefill workers
     "PREFILL_SLICES":
     lambda: os.getenv("PREFILL_SLICES", ""),

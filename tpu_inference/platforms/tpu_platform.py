@@ -247,6 +247,15 @@ class TpuPlatform(Platform):
                                 {}).get("enable_dp_attention", False)
         incompatible = enable_dp_attention or vllm_envs.VLLM_TPU_USING_PATHWAYS
 
+        if envs.TPU_MESH_BASED_DP:
+            if envs.TPU_MULTIPROCESS_DP:
+                raise ValueError(
+                    "TPU_MESH_BASED_DP=1 is incompatible with TPU_MULTIPROCESS_DP=1. "
+                    "Mesh-based DP is a single-process DP mode. Set TPU_MULTIPROCESS_DP=0.")
+            os.environ["TPU_MULTIPROCESS_DP"] = "0"
+            logger.info("Resolved TPU_MULTIPROCESS_DP=0 (due to TPU_MESH_BASED_DP=1)")
+            return
+
         requested = envs.TPU_MULTIPROCESS_DP
         if requested is not None:
             if requested and incompatible:

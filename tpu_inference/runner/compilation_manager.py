@@ -392,16 +392,22 @@ class CompilationManager:
             num_tokens = inputs_embeds.shape[0]
         assert num_tokens is not None
 
-        dp_size = self.runner.vllm_config.sharding_config.total_dp_size
+        if envs.TPU_MESH_BASED_DP:
+            dp_size = 1
+            max_num_reqs = self.runner.max_num_reqs // self.runner.dp_size
+        else:
+            dp_size = self.runner.vllm_config.sharding_config.total_dp_size
+            max_num_reqs = self.runner.max_num_reqs
+
         metadata_attn_sharding = NamedSharding(
             self.runner.mesh, PartitionSpec(ShardingAxisName.BATCH))
         pcp_size = self.runner.vllm_config.sharding_config.prefill_cp_size
 
         # Keep existing pattern for complex array operations
-        seq_lens = self._create_dummy_tensor((self.runner.max_num_reqs, ),
+        seq_lens = self._create_dummy_tensor((max_num_reqs, ),
                                              jnp.int32, metadata_attn_sharding)
         query_start_loc = self._create_dummy_tensor(
-            (self.runner.max_num_reqs + dp_size, ), jnp.int32,
+            (max_num_reqs + dp_size, ), jnp.int32,
             metadata_attn_sharding)
 
         # Keep existing pattern for specific value arrays
@@ -411,7 +417,7 @@ class CompilationManager:
                                             sharding=metadata_attn_sharding)
         pcp = None
         if pcp_size > 1:
-            n_reqs = self.runner.max_num_reqs
+            n_reqs = max_num_reqs
             pcp_spec = NamedSharding(
                 self.runner.mesh,
                 PartitionSpec(ShardingAxisName.PREFILL_CONTEXT, None))
@@ -437,7 +443,7 @@ class CompilationManager:
         if self.runner.kv_cache_config.has_mamba_layers:
             mamba_state_indices = device_array(self.runner.mesh,
                                                np.zeros(
-                                                   self.runner.max_num_reqs,
+                                                   max_num_reqs,
                                                    dtype=np.int32),
                                                sharding=metadata_attn_sharding)
         else:
@@ -445,7 +451,7 @@ class CompilationManager:
 
         def build_block_table(kv_cache_gid: int) -> jax.Array:
             block_table_obj = self.runner.input_batch.block_table[kv_cache_gid]
-            shape = (self.runner.max_num_reqs,
+            shape = (max_num_reqs,
                      block_table_obj.max_num_blocks_per_req)
             block_tables = np.zeros(shape, dtype=np.int32)
             block_tables = block_tables.reshape(-1)
@@ -453,6 +459,8 @@ class CompilationManager:
                                         block_tables,
                                         sharding=metadata_attn_sharding)
             return block_tables
+
+        mesh_for_meta = self.runner.mesh if envs.TPU_MESH_BASED_DP else None
 
         def build_attn(block_tables: jax.Array | None) -> AttentionMetadata:
             attention_metadata_gid = AttentionMetadata(
@@ -464,6 +472,7 @@ class CompilationManager:
                 mamba_state_indices=mamba_state_indices,
                 padded_num_reqs=num_reqs,
                 pcp=pcp,
+                mesh=mesh_for_meta,
             )
 
             return attention_metadata_gid
@@ -476,6 +485,7 @@ class CompilationManager:
                 request_distribution=request_distribution,
                 mamba_state_indices=mamba_state_indices,
                 padded_num_reqs=num_reqs,
+                mesh=mesh_for_meta,
             )
 
         attention_metadata: AttentionMetadata | dict[str, AttentionMetadata]
@@ -912,7 +922,10 @@ class CompilationManager:
     def _precompile_compute_logits(self) -> None:
         logger.info("Compiling compute_logits with different input shapes.")
         hsize = self.runner.model_config.get_hidden_size()
-        leading_shape = self.runner.num_reqs_paddings if not self.runner.speculative_config else self.runner.num_logits_paddings
+        if envs.TPU_MESH_BASED_DP:
+            leading_shape = self.runner.num_reqs_paddings_per_dp
+        else:
+            leading_shape = self.runner.num_reqs_paddings if not self.runner.speculative_config else self.runner.num_logits_paddings
         # Use PartitionSpec(ATTN_DATA, None) (2D explicit) to match the sharding
         # that _select_from_array_fn produces at inference time. shard_map with
         # out_specs=P('data') returns arrays with spec P('data', None); since
@@ -1455,7 +1468,12 @@ class CompilationManager:
         draft_hidden_size = self.runner.speculative_config.draft_model_config.get_hidden_size(
         )
         dtype = self.runner.model_config.dtype
-        dp_size = self.runner.dp_size
+        if envs.TPU_MESH_BASED_DP:
+            dp_size = 1
+            max_num_reqs = self.runner.max_num_reqs // self.runner.dp_size
+        else:
+            dp_size = self.runner.dp_size
+            max_num_reqs = self.runner.max_num_reqs
 
         num_kv_cache_groups = len(self.runner.kv_cache_config.kv_cache_groups)
         draft_kv_cache_group_id = num_kv_cache_groups - 1
@@ -1467,12 +1485,12 @@ class CompilationManager:
                                     block_tables,
                                     sharding=dp_sharding)
 
-        seq_lens = self._create_dummy_tensor((self.runner.max_num_reqs, ),
+        seq_lens = self._create_dummy_tensor((max_num_reqs, ),
                                              jnp.int32, dp_sharding)
         # query_start_loc carries one start-of-loc entry per DP rank, matching
         # the runtime layout produced by `_prepare_inputs`.
         query_start_loc = self._create_dummy_tensor(
-            (self.runner.max_num_reqs + dp_size, ), jnp.int32, dp_sharding)
+            (max_num_reqs + dp_size, ), jnp.int32, dp_sharding)
 
         # request_distribution stores 3 counters per DP rank
         # (decode/decode/total), so the shape scales with dp_size.
@@ -1489,7 +1507,7 @@ class CompilationManager:
         if self.runner.kv_cache_config.has_mamba_layers:
             eagle3_mamba_state_indices = device_array(
                 self.runner.mesh,
-                np.zeros(self.runner.max_num_reqs, dtype=np.int32),
+                np.zeros(max_num_reqs, dtype=np.int32),
                 sharding=dp_sharding)
         else:
             eagle3_mamba_state_indices = None
@@ -1498,7 +1516,7 @@ class CompilationManager:
                                                 jnp.int32,
                                                 sharding=dp_sharding)
         last_token_indices = self._create_dummy_tensor(
-            (self.runner.max_num_reqs, ), jnp.int32, dp_sharding)
+            (max_num_reqs, ), jnp.int32, dp_sharding)
         for num_tokens in self.runner.num_tokens_paddings:
             for num_reqs in self.runner.attn_num_reqs_paddings:
                 positions = self._create_dummy_tensor((num_tokens, ),
@@ -1511,6 +1529,7 @@ class CompilationManager:
                     request_distribution=request_distribution,
                     mamba_state_indices=eagle3_mamba_state_indices,
                     padded_num_reqs=num_reqs,
+                    mesh=self.runner.mesh if envs.TPU_MESH_BASED_DP else None,
                 )
 
                 def drafter_propose_warmup(_fn, _args, _call_kwargs):
@@ -1590,7 +1609,12 @@ class CompilationManager:
         draft_hidden_size = self.runner.speculative_config.draft_model_config.get_hidden_size(
         )
         dtype = self.runner.model_config.dtype
-        dp_size = self.runner.dp_size
+        if envs.TPU_MESH_BASED_DP:
+            dp_size = 1
+            max_num_reqs = self.runner.max_num_reqs // self.runner.dp_size
+        else:
+            dp_size = self.runner.dp_size
+            max_num_reqs = self.runner.max_num_reqs
 
         num_kv_cache_groups = len(self.runner.kv_cache_config.kv_cache_groups)
         draft_kv_cache_group_id = num_kv_cache_groups - 1
@@ -1602,12 +1626,12 @@ class CompilationManager:
                                     block_tables,
                                     sharding=dp_sharding)
 
-        seq_lens = self._create_dummy_tensor((self.runner.max_num_reqs, ),
+        seq_lens = self._create_dummy_tensor((max_num_reqs, ),
                                              jnp.int32, dp_sharding)
         # query_start_loc carries one start-of-loc entry per DP rank, matching
         # the runtime layout produced by `_prepare_inputs`.
         query_start_loc = self._create_dummy_tensor(
-            (self.runner.max_num_reqs + dp_size, ), jnp.int32, dp_sharding)
+            (max_num_reqs + dp_size, ), jnp.int32, dp_sharding)
 
         # request_distribution stores 3 counters per DP rank
         # (decode/decode/total), so the shape scales with dp_size.
@@ -1624,7 +1648,7 @@ class CompilationManager:
         if self.runner.kv_cache_config.has_mamba_layers:
             mamba_state_indices = device_array(self.runner.mesh,
                                                np.zeros(
-                                                   self.runner.max_num_reqs,
+                                                   max_num_reqs,
                                                    dtype=np.int32),
                                                sharding=dp_sharding)
         else:
@@ -1634,7 +1658,7 @@ class CompilationManager:
                                                 jnp.int32,
                                                 sharding=dp_sharding)
         last_token_indices = self._create_dummy_tensor(
-            (self.runner.max_num_reqs, ), jnp.int32, dp_sharding)
+            (max_num_reqs, ), jnp.int32, dp_sharding)
         for num_tokens in self.runner.num_tokens_paddings:
             for num_reqs in self.runner.attn_num_reqs_paddings:
                 if self.runner.uses_mrope:
@@ -1655,6 +1679,7 @@ class CompilationManager:
                     request_distribution=request_distribution,
                     mamba_state_indices=mamba_state_indices,
                     padded_num_reqs=num_reqs,
+                    mesh=self.runner.mesh if envs.TPU_MESH_BASED_DP else None,
                 )
 
                 def drafter_propose_warmup(_fn, _args, _call_kwargs):
@@ -1720,7 +1745,12 @@ class CompilationManager:
         logger.info("Compiling dflash jitted helpers.")
         target_hidden_size = self.runner.model_config.get_hidden_size()
         dtype = self.runner.model_config.dtype
-        dp_size = self.runner.dp_size
+        if envs.TPU_MESH_BASED_DP:
+            dp_size = 1
+            max_num_reqs = self.runner.max_num_reqs // self.runner.dp_size
+        else:
+            dp_size = self.runner.dp_size
+            max_num_reqs = self.runner.max_num_reqs
 
         num_kv_cache_groups = len(self.runner.kv_cache_config.kv_cache_groups)
         draft_kv_cache_group_id = num_kv_cache_groups - 1
@@ -1735,10 +1765,10 @@ class CompilationManager:
                                     block_tables,
                                     sharding=dp_sharding)
 
-        seq_lens = self._create_dummy_tensor((self.runner.max_num_reqs, ),
+        seq_lens = self._create_dummy_tensor((max_num_reqs, ),
                                              jnp.int32, dp_sharding)
         query_start_loc = self._create_dummy_tensor(
-            (self.runner.max_num_reqs + dp_size, ), jnp.int32, dp_sharding)
+            (max_num_reqs + dp_size, ), jnp.int32, dp_sharding)
 
         request_distribution = np.array([0, 0, 0] * dp_size, dtype=np.int32)
         request_distribution = device_array(self.runner.mesh,
@@ -1748,7 +1778,7 @@ class CompilationManager:
         if self.runner.kv_cache_config.has_mamba_layers:
             dflash_mamba_state_indices = device_array(
                 self.runner.mesh,
-                np.zeros(self.runner.max_num_reqs, dtype=np.int32),
+                np.zeros(max_num_reqs, dtype=np.int32),
                 sharding=dp_sharding)
         else:
             dflash_mamba_state_indices = None
@@ -1757,7 +1787,7 @@ class CompilationManager:
                                                 jnp.int32,
                                                 sharding=dp_sharding)
         last_token_indices = self._create_dummy_tensor(
-            (self.runner.max_num_reqs, ), jnp.int32, dp_sharding)
+            (max_num_reqs, ), jnp.int32, dp_sharding)
 
         # Get number of auxiliary layers configured for dflash target features
         hf_config = self.runner.speculative_config.draft_model_config.hf_config
@@ -1789,6 +1819,7 @@ class CompilationManager:
                     request_distribution=request_distribution,
                     mamba_state_indices=dflash_mamba_state_indices,
                     padded_num_reqs=num_reqs,
+                    mesh=self.runner.mesh if envs.TPU_MESH_BASED_DP else None,
                 )
 
                 def drafter_propose_warmup(_fn,
@@ -1848,6 +1879,7 @@ class CompilationManager:
                     request_distribution=request_distribution,
                     mamba_state_indices=dflash_mamba_state_indices,
                     padded_num_reqs=num_reqs,
+                    mesh=self.runner.mesh if envs.TPU_MESH_BASED_DP else None,
                 )
 
                 aux_hidden_states = [
@@ -1920,7 +1952,12 @@ class CompilationManager:
 
     def _precompile_continue_decode(self) -> None:
         logger.info("Precompiling continue_decode loop.")
-        dp_size = self.runner.vllm_config.sharding_config.total_dp_size
+        if envs.TPU_MESH_BASED_DP:
+            dp_size = 1
+            max_num_reqs = self.runner.max_num_reqs // self.runner.dp_size
+        else:
+            dp_size = self.runner.vllm_config.sharding_config.total_dp_size
+            max_num_reqs = self.runner.max_num_reqs
         dp_spec = PartitionSpec(ShardingAxisName.ATTN_DATA, )
         dp_sharding = NamedSharding(self.runner.mesh, dp_spec)
 
@@ -1948,10 +1985,10 @@ class CompilationManager:
             active_mask = self._create_dummy_tensor((num_reqs, ), jnp.bool_,
                                                     dp_sharding)
 
-            seq_lens = self._create_dummy_tensor((self.runner.max_num_reqs, ),
+            seq_lens = self._create_dummy_tensor((max_num_reqs, ),
                                                  jnp.int32, dp_sharding)
             query_start_loc = self._create_dummy_tensor(
-                (self.runner.max_num_reqs + dp_size, ), jnp.int32, dp_sharding)
+                (max_num_reqs + dp_size, ), jnp.int32, dp_sharding)
 
             request_distribution = np.array([0, 0, 0] * dp_size,
                                             dtype=np.int32)
@@ -1962,7 +1999,7 @@ class CompilationManager:
             if self.runner.kv_cache_config.has_mamba_layers:
                 mamba_state_indices = device_array(
                     self.runner.mesh,
-                    np.zeros(self.runner.max_num_reqs, dtype=np.int32),
+                    np.zeros(max_num_reqs, dtype=np.int32),
                     sharding=dp_sharding)
             else:
                 mamba_state_indices = None
@@ -1970,7 +2007,7 @@ class CompilationManager:
             def build_block_table(kv_cache_gid: int) -> jax.Array:
                 block_table_obj = self.runner.input_batch.block_table[
                     kv_cache_gid]
-                shape = (self.runner.max_num_reqs,
+                shape = (max_num_reqs,
                          block_table_obj.max_num_blocks_per_req)
                 block_tables = np.zeros(shape, dtype=np.int32)
                 block_tables = block_tables.reshape(-1)
@@ -1984,6 +2021,7 @@ class CompilationManager:
                     self.runner.kv_cache_config.kv_cache_groups) == 0
                 block_tables = build_block_table(
                     0) if not no_kv_cache else None
+                mesh_for_meta = self.runner.mesh if envs.TPU_MESH_BASED_DP else None
                 attn_metadata = AttentionMetadata(
                     input_positions=init_tokens,
                     block_tables=block_tables,
@@ -1992,8 +2030,10 @@ class CompilationManager:
                     request_distribution=request_distribution,
                     mamba_state_indices=mamba_state_indices,
                     padded_num_reqs=num_reqs,
+                    mesh=mesh_for_meta,
                 )
             else:
+                mesh_for_meta = self.runner.mesh if envs.TPU_MESH_BASED_DP else None
                 attn_metadata = GroupedAttentionMetadata(
                     groups=tuple(
                         AttentionMetadata(
@@ -2004,6 +2044,7 @@ class CompilationManager:
                             request_distribution=request_distribution,
                             mamba_state_indices=mamba_state_indices,
                             padded_num_reqs=num_reqs,
+                            mesh=mesh_for_meta,
                         ) for gid in range(
                             len(self.runner.kv_cache_config.kv_cache_groups))),
                     layer_names_per_group=tuple(

@@ -510,7 +510,12 @@ class TPUWorker(WorkerBase):
 
     def determine_available_memory(self) -> int:
         gpu_memory_utilization = self.cache_config.gpu_memory_utilization
-        hbm_usage = utils.hbm_usage_bytes(self.devices)
+        devices_to_measure = self.devices
+        if envs.TPU_MESH_BASED_DP and getattr(self.model_runner, "dp_size", 1) > 1:
+            tp_size = len(self.devices) // self.model_runner.dp_size
+            devices_to_measure = self.devices[:tp_size]
+
+        hbm_usage = utils.hbm_usage_bytes(devices_to_measure)
         total_hbm_limit = total_hbm_used = 0
         for used, limit in hbm_usage:
             total_hbm_used += used

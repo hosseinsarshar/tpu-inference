@@ -15,6 +15,7 @@
 import functools
 import math
 from dataclasses import dataclass
+from typing import Any
 
 import jax
 from vllm.utils.math_utils import cdiv
@@ -57,7 +58,7 @@ class PCPMetadata:
         "mamba_state_indices",
         "pcp",
     ],
-    meta_fields=["padded_num_reqs", "pcp_cache_pages"],
+    meta_fields=["padded_num_reqs", "pcp_cache_pages", "mesh"],
 )
 @dataclass
 class AttentionMetadata(object):
@@ -94,6 +95,9 @@ class AttentionMetadata(object):
     # PCP gather-KV only. Number of kv pages occupied by the current request.
     pcp_cache_pages: int | None = None
 
+    # Specific execution mesh for Mesh-based Data Parallelism
+    mesh: Any | None = None
+
 
 @functools.partial(
     jax.tree_util.register_dataclass,
@@ -104,7 +108,7 @@ class AttentionMetadata(object):
         "request_distribution",
         "mamba_state_indices",
     ],
-    meta_fields=["padded_num_reqs"],
+    meta_fields=["padded_num_reqs", "mesh"],
 )
 @dataclass
 class SharedAttentionMetadata(object):
@@ -131,6 +135,9 @@ class SharedAttentionMetadata(object):
     # power of 2 between min and max requests.
     # Env var ATTN_CUSTOM_NUM_REQS_BUCKETS can manually override the buckets.
     padded_num_reqs: int = -1
+
+    # Specific execution mesh for Mesh-based Data Parallelism
+    mesh: Any | None = None
 
 
 class GroupedAttentionMetadata(dict):

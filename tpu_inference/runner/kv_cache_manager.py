@@ -766,6 +766,7 @@ class KVCacheManager:
                                     duplicate_shared_layers=False)
             return
 
+
         # If this is true, then we'll initialize a new KV cache for each layer in "shared_by"
         # instead of the default behavior of initializing a single KV cache for each of the
         # shared layers
@@ -949,6 +950,23 @@ class KVCacheManager:
 
         self._log_kv_cache_init(kv_cache_config, kv_caches, num_blocks_list,
                                 metadata, duplicate_shared_layers)
+
+    def initialize_mesh_dp_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        """Initializes a separate KV cache for each DP rank on its own Mesh."""
+        dp_kv_caches = []
+        saved_mesh = self.runner.mesh
+        try:
+            for r, mesh_r in enumerate(self.runner.dp_meshes):
+                self.runner.mesh = mesh_r
+                self.runner.kv_caches = []
+                self.initialize_kv_cache(kv_cache_config)
+                dp_kv_caches.append(self.runner.kv_caches)
+        finally:
+            self.runner.mesh = saved_mesh
+
+        self.runner.dp_kv_caches = dp_kv_caches
+        self.runner.kv_caches = dp_kv_caches[0]
+        logger.info(f"Initialized mesh-based DP KV caches for {len(dp_kv_caches)} ranks.")
 
     def _log_kv_cache_init(self, kv_cache_config: KVCacheConfig,
                            kv_caches: List[jax.Array],

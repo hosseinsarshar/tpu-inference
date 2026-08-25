@@ -845,9 +845,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self._substitute_placeholder_token_fn = _substitute_placeholder_token
         self.execute_model_state: ExecuteModelState | None = None
         self._continue_decode_output = None
-        self.batch_counter = 0
-
-        self.kv_caches: list[jax.Array] = []
+        self._kv_caches: list[jax.Array] = []
+        self._dp_kv_caches: list[list[jax.Array]] = []
         self.layer_name_to_kvcache_index: dict[str, int] = {}
 
         self.is_pooling_model: bool = self.model_config.runner_type == "pooling"
@@ -866,6 +865,28 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.eos_token_id = runner_utils.get_eos_token_id(self.model_config)
         self.pad_token_id = runner_utils.get_pad_token_id(self.model_config)
 
+    @property
+    def kv_caches(self) -> list[jax.Array]:
+        if self._dp_kv_caches:
+            return self._dp_kv_caches[0]
+        return self._kv_caches
+
+    @kv_caches.setter
+    def kv_caches(self, value: list[jax.Array]) -> None:
+        self._kv_caches = value
+        if self._dp_kv_caches:
+            self._dp_kv_caches[0] = value
+
+    @property
+    def dp_kv_caches(self) -> list[list[jax.Array]]:
+        return self._dp_kv_caches
+
+    @dp_kv_caches.setter
+    def dp_kv_caches(self, value: list[list[jax.Array]]) -> None:
+        self._dp_kv_caches = value
+        if value:
+            self._kv_caches = value[0]
+
     def _init_random(self):
         if self.model_config.seed is None:
             self.model_config.seed = 0
@@ -874,15 +895,19 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.rng_key = jax.random.key(self.model_config.seed)
 
     def _init_mesh(self) -> None:
-        if envs.NEW_MODEL_DESIGN:
+        if envs.TPU_MESH_BASED_DP:
+            self.dp_meshes, self.dp_shardings = self._create_dp_meshes()
+            self.mesh = self.dp_meshes[0]
+            logger.info(f"Init mesh-based DP | dp_size={len(self.dp_meshes)}, mesh[0]={self.mesh}")
+        elif envs.NEW_MODEL_DESIGN:
             self.mesh = self._create_new_model_mesh()
+            logger.info(f"Init mesh | mesh={self.mesh}")
         else:
             # NOTE(wenxindongwork): The new MoE kernel expects a 2D mesh, so we need
             # to create a 2D mesh for now. We should make the new_model_mesh as the default
             # in the future.
             self.mesh = self._create_2d_mesh()
-
-        logger.info(f"Init mesh | mesh={self.mesh}")
+            logger.info(f"Init mesh | mesh={self.mesh}")
 
     def _create_new_model_mesh(self) -> jax.sharding.Mesh:
         num_slices = envs.NUM_SLICES
@@ -992,6 +1017,40 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             return make_optimized_mesh(mesh_shape,
                                        MESH_AXIS_NAMES_2D,
                                        devices=self.devices)
+
+    def _create_dp_meshes(self) -> Tuple[List[jax.sharding.Mesh], List[NamedSharding]]:
+        """Creates a separate Mesh for each DP rank covering its tp_size devices."""
+        sharding_strategy: ShardingConfigManager = self.vllm_config.sharding_config
+        dp_size = sharding_strategy.model_dp_size
+        tp_size = sharding_strategy.tp_size
+
+        num_devices = dp_size * tp_size
+        if len(self.devices) < num_devices:
+            raise ValueError(
+                f"Insufficient devices for mesh-based DP: found {len(self.devices)}, "
+                f"expected {num_devices} ({dp_size} ranks x {tp_size} TP).")
+
+        dp_meshes: List[jax.sharding.Mesh] = []
+        dp_shardings: List[NamedSharding] = []
+
+        if envs.NEW_MODEL_DESIGN:
+            submesh_shape = (1, 1, 1, 1, tp_size, 1, 1)
+            axis_names = MESH_AXIS_NAMES
+        else:
+            submesh_shape = (1, tp_size)
+            axis_names = MESH_AXIS_NAMES_2D
+
+        for r in range(dp_size):
+            rank_devices = self.devices[r * tp_size : (r + 1) * tp_size]
+            mesh_r = jax.sharding.Mesh(
+                np.array(rank_devices).reshape(submesh_shape),
+                axis_names=axis_names,
+            )
+            sharding_r = NamedSharding(mesh_r, PartitionSpec())
+            dp_meshes.append(mesh_r)
+            dp_shardings.append(sharding_r)
+
+        return dp_meshes, dp_shardings
 
     def _init_phased_profiling(self) -> None:
         self.phased_profiling_dir = envs.PHASED_PROFILING_DIR
@@ -1208,6 +1267,18 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             self.model = model.model
             self.state_leaves = model.state_leaves
 
+            if envs.TPU_MESH_BASED_DP:
+                self.dp_state_leaves = []
+                for r in range(self.dp_size):
+                    sharding_r = self.dp_shardings[r]
+                    leaves_r = jax.tree_util.tree_map(
+                        lambda leaf: jax.device_put(leaf, sharding_r) if isinstance(leaf, jax.Array) else leaf,
+                        self.state_leaves,
+                    )
+                    self.dp_state_leaves.append(leaves_r)
+            else:
+                self.dp_state_leaves = None
+
             if self.drafter is not None:
                 logger.info("Loading drafter model...")
                 self.drafter.load_model(self.state)
@@ -1284,7 +1355,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.topology_order_id = topology_order_id
         self.kv_cache_config = kv_cache_config
         self.use_hybrid_kvcache = len(kv_cache_config.kv_cache_groups) > 1
-        self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
+        if envs.TPU_MESH_BASED_DP:
+            self.kv_cache_manager.initialize_mesh_dp_kv_cache(kv_cache_config)
+        else:
+            self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
         self.input_batch.has_mamba_layers = kv_cache_config.has_mamba_layers
 
         if self.kv_cache_manager.actual_mamba_num_blocks is not None:
@@ -1548,6 +1622,114 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         return placeholder_req_id_to_index
 
+    def _execute_model_mesh_dp(
+        self,
+        scheduler_output: "VllmSchedulerOutput",
+        intermediate_tensors: Optional[JaxIntermediateTensors] = None,
+    ) -> JaxIntermediateTensors | ModelRunnerOutput | None:
+        """Executes the model using per-DP-rank independent meshes."""
+        if self.scheduler_config.async_scheduling and self._pre_async_results is not None:
+            self._modify_prev_results()
+            self._pre_async_results = None
+
+        (
+            dp_inputs,
+            sampling_metadata,
+            logits_indices_selector,
+            padded_num_reqs,
+            req_ids_dp,
+            padded_num_scheduled_tokens_per_dp_rank,
+        ) = self._prepare_inputs_mesh_dp(scheduler_output)
+
+        lora_metadata = self.lora_utils.extract_lora_metadata()
+
+        dp_logits = []
+        dp_hidden_states = []
+        dp_aux_hidden_states = []
+
+        with self.maybe_forbid_compile:
+            with set_forward_context(
+                    None,
+                    self.vllm_config,
+            ), self.maybe_get_kv_connector_output(
+                    scheduler_output) as kv_connector_output:
+                for r in range(self.dp_size):
+                    mesh_r = self.dp_meshes[r]
+                    dp_input_r = dp_inputs[r]
+                    kv_cache_r = self.dp_kv_caches[r] if hasattr(self, "dp_kv_caches") else self.kv_caches
+                    state_leaves_r = self.dp_state_leaves[r] if getattr(self, "dp_state_leaves", None) is not None else self.state_leaves
+
+                    with jax.set_mesh(mesh_r):
+                        (
+                            new_kv_cache_r,
+                            hidden_states_r,
+                            aux_hidden_states_r,
+                            expert_indices_r,
+                        ) = self.model_fn(
+                            state_leaves_r,
+                            kv_cache_r,
+                            dp_input_r["input_ids"],
+                            dp_input_r["attn_metadata"],
+                            None,  # inputs_embeds
+                            dp_input_r["positions"],
+                            tuple(self.layer_name_to_kvcache_index.items()),
+                            lora_metadata,
+                            intermediate_tensors,
+                            self.is_first_rank,
+                            self.is_last_rank,
+                            shared_attention_metadata=dp_input_r["shared_attn_metadata"],
+                        )
+
+                        if hasattr(self, "dp_kv_caches"):
+                            self.dp_kv_caches[r] = new_kv_cache_r
+                        else:
+                            self.kv_caches = new_kv_cache_r
+
+                        # Select hidden states for logits computation
+                        if dp_input_r["logits_indices"] is not None:
+                            selected_hidden_states_r = hidden_states_r[dp_input_r["logits_indices"]]
+                        else:
+                            selected_hidden_states_r = hidden_states_r
+
+                        logits_r = self.compute_logits_fn(
+                            state_leaves_r,
+                            selected_hidden_states_r,
+                            lora_metadata,
+                        )
+
+                    dp_logits.append(logits_r)
+                    dp_hidden_states.append(hidden_states_r)
+                    dp_aux_hidden_states.append(aux_hidden_states_r)
+
+        # Gather per-rank logits and stack across all ranks
+        cpu_logits = [jax.device_get(out) for out in dp_logits]
+        flat_logits = np.concatenate(cpu_logits, axis=0)
+
+        # Place the full padded logits onto the primary mesh for downstream sampling
+        logits_jax = jax.device_put(flat_logits, self.dp_shardings[0])
+
+        self.execute_model_state = ExecuteModelState(
+            scheduler_output=scheduler_output,
+            attn_metadata=dp_inputs[0]["attn_metadata"],
+            shared_attn_metadata=dp_inputs[0]["shared_attn_metadata"],
+            sampling_metadata=sampling_metadata,
+            input_ids=dp_inputs[0]["input_ids"],
+            hidden_states=dp_hidden_states[0],
+            logits=logits_jax,
+            aux_hidden_states=dp_aux_hidden_states[0],
+            spec_decode_metadata=None,
+            kv_connector_output=kv_connector_output,
+            logits_indices_selector=logits_indices_selector,
+            padded_num_reqs=padded_num_reqs,
+            expert_indices=None,
+            full_hidden_states=None,
+            full_logits=None,
+            req_ids_dp=req_ids_dp,
+            padded_num_scheduled_tokens_per_dp_rank=padded_num_scheduled_tokens_per_dp_rank,
+        )
+
+        return None
+
     def _execute_model(
         self,
         scheduler_output: "VllmSchedulerOutput",
@@ -1575,6 +1757,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 # raise Exception(
                 #     "Should not schedule a request that does nothing!")
             return EMPTY_MODEL_RUNNER_OUTPUT
+
+        if envs.TPU_MESH_BASED_DP:
+            return self._execute_model_mesh_dp(scheduler_output, intermediate_tensors)
 
         # Check if the entire batch is in the decode phase.
         # request_distribution[0] tracks the number of decode requests.
@@ -2643,7 +2828,185 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 seq_lens_subtract_indices, positions_subtract_indices)
         return seq_lens, positions
 
+    def _prepare_inputs_mesh_dp(self, scheduler_output: "VllmSchedulerOutput"):
+        """Prepares per-DP-rank input tensors and places them on their respective Meshes."""
+        dp_size = self.dp_size
+        num_reqs = self.input_batch.num_reqs
+        assert num_reqs > 0
+
+        (
+            req_ids_dp, req_indices_dp, num_scheduled_tokens_per_dp_rank,
+            scheduled_tokens_per_dp_rank, num_req_per_dp_rank,
+            padded_num_scheduled_tokens_per_dp_rank, padded_num_reqs,
+            attn_padded_num_reqs, padded_total_num_scheduled_tokens,
+            padded_num_reqs_per_dp_rank, logits_indices_selector,
+            tokens_indices_selector, max_num_reqs_per_dp_rank
+        ) = self._prepare_input_metadata(scheduler_output)
+
+        padded_reqs_list = []
+        padded_tokens_list = []
+        dp_inputs = []
+        for r in range(dp_size):
+            sharding_r = self.dp_shardings[r]
+            mesh_r = self.dp_meshes[r]
+
+            _num_reqs = num_req_per_dp_rank[r]
+            _num_tokens = num_scheduled_tokens_per_dp_rank[r]
+
+            is_rank_decode_only = (
+                _num_reqs > 0 and sum(1 for req_id in req_ids_dp[r]
+                                      if scheduler_output.num_scheduled_tokens[req_id] == 1) == _num_reqs
+            )
+
+            padded_reqs_r = runner_utils.get_padded_token_len(
+                self.num_reqs_paddings_per_dp, max(_num_reqs, 1)
+            )
+            if is_rank_decode_only and self.enable_continue_decode:
+                padded_tokens_r = padded_reqs_r
+            else:
+                padded_tokens_r = runner_utils.get_padded_token_len(
+                    self.num_tokens_paddings_per_dp, max(_num_tokens, 1)
+                )
+
+            padded_reqs_list.append(padded_reqs_r)
+            padded_tokens_list.append(padded_tokens_r)
+
+            input_ids_r = np.zeros((padded_tokens_r,), dtype=np.int32)
+            positions_r = np.zeros((padded_tokens_r,), dtype=np.int32)
+            seq_lens_r = np.zeros((padded_reqs_r,), dtype=np.int32)
+            query_start_loc_r = np.zeros((padded_reqs_r + 1,), dtype=np.int32)
+            logits_indices_r = np.zeros((padded_reqs_r,), dtype=np.int32)
+
+            if _num_reqs > 0:
+                num_scheduled_tokens_per_req = scheduled_tokens_per_dp_rank[r]
+                req_indices = req_indices_dp[r]
+                total_sched = num_scheduled_tokens_per_dp_rank[r]
+
+                # Map tokens
+                req_indices_repeat = np.repeat(req_indices, num_scheduled_tokens_per_req)
+                arange = np.concatenate([self.arange_cpu[:n] for n in num_scheduled_tokens_per_req])
+
+                positions_np = positions_r[:total_sched]
+                np.add(
+                    self.input_batch.num_computed_tokens_cpu[req_indices_repeat],
+                    arange,
+                    out=positions_np,
+                )
+
+                token_indices = (
+                    positions_np +
+                    req_indices_repeat * self.input_batch.token_ids_cpu.shape[1]
+                )
+                np.take(
+                    self.input_batch.token_ids_cpu.ravel(),
+                    token_indices,
+                    out=input_ids_r[:total_sched],
+                )
+
+                # query_start_loc & seq_lens
+                query_start_loc_r[0] = 0
+                np.cumsum(num_scheduled_tokens_per_req, out=query_start_loc_r[1:_num_reqs + 1])
+                query_start_loc_r[_num_reqs + 1:] = query_start_loc_r[_num_reqs]
+
+                seq_lens_r[:_num_reqs] = (
+                    self.input_batch.num_computed_tokens_cpu[req_indices] +
+                    num_scheduled_tokens_per_req
+                )
+
+                # logits_indices
+                logits_indices_r[:_num_reqs] = (query_start_loc_r[1:_num_reqs + 1] - 1)
+
+            # Block tables for rank r
+            block_tables_r = None
+            if self.kv_cache_config.kv_cache_groups:
+                block_table_obj = self.input_batch.block_table[0]
+                bt_view = np.zeros((padded_reqs_r, block_table_obj.max_num_blocks_per_req), dtype=np.int32)
+                if _num_reqs > 0:
+                    cpu_tensor = block_table_obj.get_cpu_tensor()
+                    np.take(cpu_tensor, req_indices_dp[r], axis=0, out=bt_view[:_num_reqs])
+                block_tables_r = jax.device_put(bt_view.reshape(-1), sharding_r)
+
+            # Request distribution for rank r
+            num_decode_in_rank = sum(1 for req_id in req_ids_dp[r] if scheduler_output.num_scheduled_tokens[req_id] == 1)
+            req_dist_r = np.array([num_decode_in_rank, num_decode_in_rank, _num_reqs], dtype=np.int32)
+
+            input_ids_jax_r = jax.device_put(input_ids_r, sharding_r)
+            positions_jax_r = jax.device_put(positions_r, sharding_r)
+            seq_lens_jax_r = jax.device_put(seq_lens_r, sharding_r)
+            query_start_loc_jax_r = jax.device_put(query_start_loc_r, sharding_r)
+            req_dist_jax_r = jax.device_put(req_dist_r, sharding_r)
+            logits_indices_jax_r = jax.device_put(logits_indices_r, sharding_r)
+
+            attn_metadata_r = AttentionMetadata(
+                input_positions=positions_jax_r,
+                block_tables=block_tables_r,
+                seq_lens=seq_lens_jax_r,
+                query_start_loc=query_start_loc_jax_r,
+                request_distribution=req_dist_jax_r,
+                mamba_state_indices=None,
+                padded_num_reqs=padded_reqs_r,
+                pcp=None,
+                mesh=mesh_r,
+            )
+
+            shared_attn_r = SharedAttentionMetadata(
+                input_positions=positions_jax_r,
+                seq_lens=seq_lens_jax_r,
+                query_start_loc=query_start_loc_jax_r,
+                request_distribution=req_dist_jax_r,
+                mamba_state_indices=None,
+                padded_num_reqs=padded_reqs_r,
+                mesh=mesh_r,
+            )
+
+            dp_inputs.append({
+                "input_ids": input_ids_jax_r,
+                "positions": positions_jax_r,
+                "attn_metadata": attn_metadata_r,
+                "shared_attn_metadata": shared_attn_r,
+                "logits_indices": logits_indices_jax_r,
+                "padded_num_reqs": padded_reqs_r,
+                "padded_num_tokens": padded_tokens_r,
+                "num_reqs": _num_reqs,
+            })
+
+        total_padded_num_reqs = sum(padded_reqs_list)
+
+        # Build logits_indices_selector with exact per-rank offsets
+        if dp_size > 1:
+            all_req_indices = np.concatenate([req_indices_dp[dp_rank] for dp_rank in range(dp_size)])
+            offsets = [0] + list(np.cumsum(padded_reqs_list))
+            all_positions = np.concatenate([
+                np.arange(len(req_indices_dp[dp_rank])) + offsets[dp_rank]
+                for dp_rank in range(dp_size)
+            ])
+            sorted_indices = np.argsort(all_req_indices)
+            logits_indices_selector = all_positions[sorted_indices]
+        else:
+            logits_indices_selector = None
+
+        # Build sampling metadata on primary mesh
+        primary_sharding = self.dp_shardings[0]
+        sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(
+            self.mesh,
+            self.input_batch,
+            total_padded_num_reqs,
+            sharding=primary_sharding,
+            req_indices_dp=req_indices_dp,
+            padded_num_reqs_per_dp_rank=padded_reqs_list,
+        )
+
+        return (
+            dp_inputs,
+            sampling_metadata,
+            logits_indices_selector,
+            total_padded_num_reqs,
+            req_ids_dp,
+            padded_tokens_list[0],
+        )
+
     def _prepare_inputs(self, scheduler_output: "VllmSchedulerOutput"):
+
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs

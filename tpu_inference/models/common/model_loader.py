@@ -353,14 +353,39 @@ def get_flax_model(
                                pooler=pooler,
                                is_draft_model=is_draft_model)
     vllm_config.model_config.dtype = original_dtype
-    kv_cache_sharding = NamedSharding(
-        mesh,
-        PartitionSpec(ShardingAxisName.BATCH, ShardingAxisName.KV_CONTEXT,
-                      ShardingAxisName.KV_HEAD))
-    hidden_states_sharding = NamedSharding(mesh,
-                                           PartitionSpec(
-                                               ShardingAxisName.ATTN_DATA,
-                                               None))  # (T, D)
+    if envs.TPU_MESH_BASED_DP:
+        model_out_shardings = None
+        draft_out_shardings = None
+        logits_out_shardings = None
+        embed_out_shardings = None
+    else:
+        kv_cache_sharding = NamedSharding(
+            mesh,
+            PartitionSpec(ShardingAxisName.BATCH, ShardingAxisName.KV_CONTEXT,
+                          ShardingAxisName.KV_HEAD))
+        hidden_states_sharding = NamedSharding(mesh,
+                                               PartitionSpec(
+                                                   ShardingAxisName.ATTN_DATA,
+                                                   None))  # (T, D)
+        logits_sharding = NamedSharding(
+            mesh,
+            PartitionSpec(ShardingAxisName.MLP_DATA, ShardingAxisName.MLP_TENSOR))
+        embed_sharding = NamedSharding(mesh, PartitionSpec(None))
+
+        model_out_shardings = (
+            kv_cache_sharding,
+            hidden_states_sharding,
+            hidden_states_sharding,  # aux hidden states
+            None,  # expert ids
+        )
+        draft_out_shardings = (
+            kv_cache_sharding,
+            hidden_states_sharding,
+            hidden_states_sharding,  # residual
+            None,  # expert ids
+        )
+        logits_out_shardings = logits_sharding
+        embed_out_shardings = embed_sharding
 
     # For performance consideration, refer to:
     # https://flax.readthedocs.io/en/latest/guides/performance.html
@@ -380,12 +405,7 @@ def get_flax_model(
 
     _wrap_with_jit = functools.partial(
         jax.jit,
-        out_shardings=(
-            kv_cache_sharding,
-            hidden_states_sharding,
-            hidden_states_sharding,  # aux hidden states
-            None,  # expert ids
-        ),
+        out_shardings=model_out_shardings,
         donate_argnums=1,  # 0 is state_leaves, 1 is kv_cache
         static_argnums=(
             6, 9, 10
@@ -404,13 +424,9 @@ def get_flax_model(
         compiler_options=get_step_fn_compiler_options(),
     )
 
-    @jax.jit(
-        out_shardings=(
-            kv_cache_sharding,
-            hidden_states_sharding,
-            hidden_states_sharding,  # residual
-            None,  # expert ids
-        ),
+    @functools.partial(
+        jax.jit,
+        out_shardings=draft_out_shardings,
         donate_argnums=1,  # 0 is state_leaves, 1 is kv_cache
         static_argnums=(5, ),  # 5 is layer_name_to_kvcache_index
     )
@@ -419,11 +435,7 @@ def get_flax_model(
         model = nnx.merge(graphdef, state)
         return model(*args)
 
-    logits_sharding = NamedSharding(
-        mesh,
-        PartitionSpec(ShardingAxisName.MLP_DATA, ShardingAxisName.MLP_TENSOR))
-
-    @jax.jit(out_shardings=(logits_sharding))
+    @functools.partial(jax.jit, out_shardings=logits_out_shardings)
     def run_compute_logits(state_leaves, *args):
         state = jax.tree_util.tree_unflatten(_state_treedef, state_leaves)
         model = nnx.merge(graphdef, state)
@@ -437,9 +449,7 @@ def get_flax_model(
         model = nnx.merge(graphdef, state)
         return model.embed_multimodal(**kwargs)
 
-    embed_sharding = NamedSharding(mesh, PartitionSpec(None))
-
-    @jax.jit(out_shardings=(embed_sharding))
+    @functools.partial(jax.jit, out_shardings=embed_out_shardings)
     def jitted_embed_input_ids(state_leaves,
                                input_ids,
                                mm_embeds,
@@ -462,7 +472,7 @@ def get_flax_model(
                                       is_multimodal=is_multimodal)
 
     # For models that want to work with EAGLE-3 speculative decoding
-    @jax.jit(out_shardings=(logits_sharding))
+    @jax.jit(out_shardings=logits_out_shardings)
     def combine_hidden_states(state_leaves, hidden_states):
         state = jax.tree_util.tree_unflatten(_state_treedef, state_leaves)
         model = nnx.merge(graphdef, state)
