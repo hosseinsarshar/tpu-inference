@@ -902,12 +902,16 @@ class SpecDecodeMetadata:
 
 def host_extract_sampled_tokens(
         runner, spec_decode_metadata: Optional[SpecDecodeMetadata],
-        sampled_output: jnp.ndarray, logits_indices_selector: np.ndarray,
+        sampled_output: jnp.ndarray | list[jnp.ndarray], logits_indices_selector: np.ndarray,
         discard_sampled_tokens_req_indices: list, num_reqs: int):
     """host retrieve the sampled tokens for the current step."""
-    next_tokens = sampled_output
+    if isinstance(sampled_output, (list, tuple)):
+        next_tokens_list = [np.asarray(jax.device_get(t)) for t in sampled_output]
+        next_tokens = np.concatenate(next_tokens_list, axis=0)
+    else:
+        next_tokens = np.asarray(jax.device_get(sampled_output))
+
     if spec_decode_metadata is None:
-        next_tokens = np.asarray(jax.device_get(next_tokens))
         # Map tokens back to the pre-dp shuffling order
         if logits_indices_selector is not None:
             next_tokens = next_tokens[logits_indices_selector]

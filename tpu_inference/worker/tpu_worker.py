@@ -663,7 +663,10 @@ class TPUWorker(WorkerBase):
             if advanced_config:
                 options.advanced_configuration = advanced_config
 
-            jax.profiler.start_trace(self.profile_dir,
+            target_dir = self.profile_dir or os.environ.get("VLLM_TORCH_PROFILER_DIR") or "/tmp/jax_profile"
+            if not target_dir.startswith("gs://"):
+                os.makedirs(target_dir, exist_ok=True)
+            jax.profiler.start_trace(target_dir,
                                      profiler_options=options)
         else:
             jax.profiler.stop_trace()

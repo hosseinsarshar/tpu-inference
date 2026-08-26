@@ -903,6 +903,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         random.seed(self.model_config.seed)
         np.random.seed(self.model_config.seed)
         self.rng_key = jax.random.key(self.model_config.seed)
+        if envs.TPU_MESH_BASED_DP and self.dp_size > 1:
+            self.dp_rng_keys = [jax.random.fold_in(self.rng_key, r) for r in range(self.dp_size)]
+        else:
+            self.dp_rng_keys = None
 
     def _init_mesh(self) -> None:
         if envs.TPU_MESH_BASED_DP:
@@ -1475,6 +1479,90 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
          )
         self.execute_model_state = None
 
+        if envs.TPU_MESH_BASED_DP:
+            if self.scheduler_config.async_scheduling:
+                if self._pre_async_results is not None:
+                    self._modify_prev_results()
+
+                num_reqs = self.input_batch.num_reqs
+                req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
+
+                request_seq_lens: list[tuple[int, CachedRequestState, int]] = []
+                discard_sampled_tokens_req_indices = []
+                for i, req_id in zip(range(num_reqs), self.input_batch.req_ids):
+                    assert req_id is not None
+                    req_state = self.requests[req_id]
+                    seq_len = (req_state.num_computed_tokens +
+                               scheduler_output.num_scheduled_tokens[req_id])
+                    if seq_len >= req_state.num_tokens:
+                        request_seq_lens.append((i, req_state, seq_len))
+                    else:
+                        generator = self.input_batch.generators.get(i)
+                        if generator is not None:
+                            generator.set_offset(generator.get_offset() - 4)
+                        discard_sampled_tokens_req_indices.append(i)
+
+                placeholder_req_id_to_index: dict[str, int] = self._update_placeholder(
+                    discard_sampled_tokens_req_indices, request_seq_lens,
+                    scheduler_output, logits_indices_selector,
+                    spec_decode_metadata)
+
+                self._pre_async_results = AsyncPreResults(
+                    req_ids=req_ids,
+                    next_tokens=logits,
+                    request_seq_lens=request_seq_lens,
+                    discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
+                    placeholder_req_id_to_index=placeholder_req_id_to_index,
+                    logits_indices_selector=logits_indices_selector,
+                    scheduler_output=scheduler_output,
+                    spec_decode_next_tokens=None,
+                    spec_decode_num_rejected_tokens=None,
+                    spec_decode_metadata=None,
+                )
+
+                model_runner_output = ModelRunnerOutput(
+                    req_ids=req_ids,
+                    req_id_to_index=self.input_batch.req_id_to_index.copy(),
+                    sampled_token_ids=[],  # Fill in async get
+                    logprobs=None,
+                    prompt_logprobs_dict={},
+                    pooler_output=[],
+                    kv_connector_output=kv_connector_output,
+                )
+                async_model_runner_output = AsyncTPUModelRunnerOutput(
+                    model_runner_output,
+                    logits,
+                    num_reqs,
+                    discard_sampled_tokens_req_indices,
+                    logits_indices_selector,
+                    logprobs_tensors=None,
+                    prompt_logprobs_async_data=None,
+                    expert_indices=None,
+                    total_num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
+                    spec_decode_metadata=spec_decode_metadata,
+                    scheduler_output=scheduler_output,
+                    req_ids_dp=req_ids_dp,
+                    padded_num_scheduled_tokens_per_dp_rank=padded_num_scheduled_tokens_per_dp_rank,
+                    runner=self)
+                return async_model_runner_output
+            else:
+                valid_sampled_token_ids = runner_utils.host_extract_sampled_tokens(
+                    self, spec_decode_metadata, logits,
+                    logits_indices_selector, [], self.input_batch.num_reqs)
+                num_reqs = self.input_batch.num_reqs
+                req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
+                for req_idx, req_id in enumerate(req_ids):
+                    req_state = self.requests[req_id]
+                    sampled_ids = valid_sampled_token_ids[req_idx]
+                    req_state.output_token_ids.extend(sampled_ids)
+                return ModelRunnerOutput(
+                    req_ids=req_ids,
+                    sampled_token_ids=valid_sampled_token_ids,
+                    logprobs=None,
+                    prompt_logprobs_dict={},
+                    routed_experts=None,
+                )
+
         with jax.set_mesh(self.mesh):
             if grammar_output is not None:
                 (
@@ -1714,11 +1802,25 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     lora_metadata,
                 )
 
-            return r, logits_r, hidden_states_r, aux_hidden_states_r
+                # Local Sub-Mesh Sampling (Zero Inter-Mesh Logit Resharding!)
+                logits_r = logits_r.astype(jnp.float32)
+                sampling_meta_r = dp_input_r["sampling_metadata"]
+                if self.dp_rng_keys is not None:
+                    self.dp_rng_keys[r], step_rng_r = jax.random.split(self.dp_rng_keys[r])
+                else:
+                    self.rng_params_for_sampling, step_rng_r = jax.random.split(self.rng_params_for_sampling)
 
-        dp_logits = []
-        dp_hidden_states = []
-        dp_aux_hidden_states = []
+                with self.maybe_forbid_compile:
+                    next_tokens_r, _ = sample(
+                        step_rng_r,
+                        mesh_r,
+                        logits_r,
+                        sampling_meta_r,
+                    )
+
+                async_tokens_r = jax.copy_to_host_async(next_tokens_r)
+
+            return r, async_tokens_r, hidden_states_r, aux_hidden_states_r
 
         with self.maybe_forbid_compile:
             with set_forward_context(
@@ -1730,23 +1832,18 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     futures = [self.dp_thread_pool.submit(_run_submesh, r) for r in range(self.dp_size)]
                     submesh_outputs = [f.result() for f in futures]
                     submesh_outputs.sort(key=lambda x: x[0])
-                    dp_logits = [out[1] for out in submesh_outputs]
+                    dp_sampled_tokens = [out[1] for out in submesh_outputs]
                     dp_hidden_states = [out[2] for out in submesh_outputs]
                     dp_aux_hidden_states = [out[3] for out in submesh_outputs]
                 else:
+                    dp_sampled_tokens = []
+                    dp_hidden_states = []
+                    dp_aux_hidden_states = []
                     for r in range(self.dp_size):
-                        _, l_r, h_r, a_r = _run_submesh(r)
-                        dp_logits.append(l_r)
+                        _, tok_r, h_r, a_r = _run_submesh(r)
+                        dp_sampled_tokens.append(tok_r)
                         dp_hidden_states.append(h_r)
                         dp_aux_hidden_states.append(a_r)
-
-        # Gather per-rank logits and concatenate directly on-device without host roundtrip
-        resharded_logits = [
-            jax.device_put(logits_r, self.dp_shardings[0]) if logits_r.sharding != self.dp_shardings[0] else logits_r
-            for logits_r in dp_logits
-        ]
-        with jax.set_mesh(self.dp_meshes[0]):
-            logits_jax = jnp.concatenate(resharded_logits, axis=0)
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
@@ -1755,7 +1852,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             sampling_metadata=sampling_metadata,
             input_ids=dp_inputs[0]["input_ids"],
             hidden_states=dp_hidden_states[0],
-            logits=logits_jax,
+            logits=dp_sampled_tokens,
             aux_hidden_states=dp_aux_hidden_states[0],
             spec_decode_metadata=None,
             kv_connector_output=kv_connector_output,
@@ -3038,12 +3135,22 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 mesh=mesh_r,
             )
 
+            sampling_metadata_r = TPUSupportedSamplingMetadata.from_input_batch(
+                mesh_r,
+                self.input_batch,
+                padded_reqs_r,
+                req_indices_dp={0: req_indices_dp[r]},
+                sharding=sharding_r,
+                padded_num_reqs_per_dp_rank=[padded_reqs_r],
+            )
+
             dp_inputs.append({
                 "input_ids": input_ids_jax_r,
                 "positions": positions_jax_r,
                 "attn_metadata": attn_metadata_r,
                 "shared_attn_metadata": shared_attn_r,
                 "logits_indices": logits_indices_jax_r,
+                "sampling_metadata": sampling_metadata_r,
                 "padded_num_reqs": padded_reqs_r,
                 "padded_num_tokens": padded_tokens_r,
                 "num_reqs": _num_reqs,
