@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     TPU_WORKER_ID: str | None = None
     TPU_MULTIHOST_BACKEND: str = ""
     TPU_MULTIPROCESS_DP: bool | None = None
+    TPU_MESH_BASED_DP: bool = False
     PREFILL_SLICES: str = ""
     DECODE_SLICES: str = ""
     SKIP_JAX_PRECOMPILE: bool = False
@@ -238,6 +239,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and Pathways).
     "TPU_MULTIPROCESS_DP":
     env_bool("TPU_MULTIPROCESS_DP", default=None),
+    # Use mesh-based data parallelism: a single process hosts one independent
+    # engine per DP rank, each bound to its own `jax.sharding.Mesh` over a
+    # disjoint slice of `jax.devices()`. Like TPU_MULTIPROCESS_DP the ranks are
+    # fully independent (no cross-rank padding or step barrier), but the
+    # isolation comes from the JAX mesh rather than from masking physical chips
+    # with libtpu env vars. Mutually exclusive with TPU_MULTIPROCESS_DP.
+    "TPU_MESH_BASED_DP":
+    env_bool("TPU_MESH_BASED_DP", default=False),
     # Slice configuration for disaggregated prefill workers
     "PREFILL_SLICES":
     lambda: os.getenv("PREFILL_SLICES", ""),

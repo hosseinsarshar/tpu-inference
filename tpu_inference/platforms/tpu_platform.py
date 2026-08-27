@@ -281,6 +281,26 @@ class TpuPlatform(Platform):
         incompatible = enable_dp_attention or vllm_envs.VLLM_TPU_USING_PATHWAYS
 
         requested = envs.TPU_MULTIPROCESS_DP
+
+        if envs.TPU_MESH_BASED_DP:
+            # Mesh-based DP is the other MPMD flavour: it keeps the ranks
+            # independent but isolates them with one `jax.sharding.Mesh` per
+            # rank inside a single process, instead of masking physical chips
+            # per process. The two cannot both own the DP ranks.
+            if requested:
+                raise ValueError(
+                    "TPU_MESH_BASED_DP=1 and TPU_MULTIPROCESS_DP=1 are "
+                    "mutually exclusive: both implement MPMD data "
+                    "parallelism. Pick one.")
+            if enable_dp_attention:
+                raise ValueError(
+                    "TPU_MESH_BASED_DP=1 is not supported with attention DP "
+                    "(enable_dp_attention).")
+            os.environ["TPU_MULTIPROCESS_DP"] = "0"
+            logger.info(
+                "Mesh-based DP requested; forcing TPU_MULTIPROCESS_DP=0")
+            return
+
         if requested is not None:
             if requested and incompatible:
                 raise ValueError(
@@ -316,6 +336,24 @@ class TpuPlatform(Platform):
                     "variable to be set and DP attention set via: --additional_config \'{\"sharding\": {\"sharding_strategy\": {\"enable_dp_attention\": true}}}\'"
                 )
         cls._initialize_sharding_config(vllm_config)
+
+        # Mesh-based DP replaces vLLM's EngineCore with one that owns a
+        # separate engine (and mesh) per rank. Install it once the sharding
+        # config exists, since that is what records the per-rank mesh size.
+        from tpu_inference.core import mesh_dp
+        if mesh_dp.is_mesh_dp_enabled(vllm_config):
+            # `EngineCoreProc` subclasses `EngineCore`, so it binds the base
+            # class at definition time and the swap below cannot reach it.
+            # Running the engine in-process is also the point of mesh DP: all
+            # ranks share one address space. Online `vllm serve` will need a
+            # dedicated `MeshDPEngineCoreProc` instead.
+            if vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING:
+                logger.info(
+                    "Mesh-based DP: disabling V1 multiprocessing so the "
+                    "engine is built in this process.")
+                os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+                vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING = False
+            mesh_dp.install()
 
         cache_config = vllm_config.cache_config
         # The TPU hybrid (mamba/linear-attention) path does not support
