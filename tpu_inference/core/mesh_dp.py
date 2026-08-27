@@ -65,7 +65,7 @@ from multiprocessing import Lock
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import jax
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.v1.engine import EngineCoreOutputs
@@ -345,10 +345,17 @@ class MeshDPEngineCore(vLLMEngineCore):
             threading.Thread(target=build, args=(r, ), name=f"mesh-dp-build-{r}")
             for r in range(self.dp_size)
         ]
-        for t in builders:
-            t.start()
-        for t in builders:
-            t.join()
+        # `set_current_vllm_config` saves and restores a module-level global, so
+        # concurrent builders clobber each other: one engine's `load_model`
+        # context exits and restores `None` while another is still in KV-cache
+        # init, which fails with "Current vLLM config is not set". Holding the
+        # config for the whole build makes every nested save/restore land on
+        # this same object, so the global is never unset while a builder runs.
+        with set_current_vllm_config(vllm_config):
+            for t in builders:
+                t.start()
+            for t in builders:
+                t.join()
         if errors:
             raise errors[0]
 
