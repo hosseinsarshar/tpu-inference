@@ -56,7 +56,9 @@ Independence and dispatch, concretely:
 
 from __future__ import annotations
 
+import os
 import queue
+import sys
 import threading
 import time
 from multiprocessing import Lock
@@ -85,6 +87,23 @@ _STEP_WAIT_S = 0.05
 
 _DEVICE_GROUPS_ATTR = "mesh_dp_device_groups"
 _NEXT_RANK_ATTR = "mesh_dp_next_rank"
+
+# One rank per thread means `dp_size` threads competing for a single GIL. A
+# step alternates between Python work and GIL-releasing device waits, and at
+# CPython's 5ms default every release sends the thread to the back of the
+# queue -- with 8 ranks that convoy stretched single steps past two seconds.
+# A coarser interval lets a rank finish more of its step per acquisition.
+_SWITCH_INTERVAL_S = float(os.getenv("TPU_MESH_DP_SWITCH_INTERVAL", "0.05"))
+
+# Rank being constructed, so engines can be built concurrently: the executor
+# runs on the builder's own thread and reads its rank from here.
+_building = threading.local()
+
+# `init_device` reaches torch.distributed's *global* default process group, so
+# concurrent builders race ("initialize the default process group twice").
+# Serialise just that call -- weight loading and XLA compilation, which are
+# the parts actually worth overlapping, stay outside the lock.
+_DEVICE_INIT_LOCK = threading.Lock()
 
 
 def is_mesh_dp_enabled(vllm_config: VllmConfig) -> bool:
@@ -147,14 +166,16 @@ class MeshDPExecutor(UniProcExecutor):
             raise RuntimeError(
                 "MeshDPExecutor used without device groups; "
                 "assign_device_groups() must run first.")
-        # Engines are constructed one at a time by MeshDPEngineCore, so a
-        # simple cursor hands each executor the next unclaimed group.
-        rank = getattr(device_config, _NEXT_RANK_ATTR, 0)
+        # MeshDPEngineCore builds the engines concurrently, so the rank comes
+        # from the thread doing the building rather than from a shared cursor.
+        rank = getattr(_building, "rank", None)
+        if rank is None:
+            rank = getattr(device_config, _NEXT_RANK_ATTR, 0)
+            setattr(device_config, _NEXT_RANK_ATTR, rank + 1)
         if rank >= len(groups):
             raise RuntimeError(
                 f"MeshDPExecutor asked for rank {rank} but only "
                 f"{len(groups)} device groups were assigned.")
-        setattr(device_config, _NEXT_RANK_ATTR, rank + 1)
 
         self.mesh_dp_rank = rank
         self.devices = groups[rank]
@@ -173,8 +194,9 @@ class MeshDPExecutor(UniProcExecutor):
             shared_worker_lock=Lock(),
             devices=self.devices,
         )
-        self.driver_worker.init_worker(all_kwargs=[kwargs])
-        self.driver_worker.init_device()
+        with _DEVICE_INIT_LOCK:
+            self.driver_worker.init_worker(all_kwargs=[kwargs])
+            self.driver_worker.init_device()
         self.driver_worker.load_model()
         current_platform.update_block_size_for_backend(self.vllm_config)
 
@@ -295,21 +317,53 @@ class MeshDPEngineCore(vLLMEngineCore):
 
         assign_device_groups(vllm_config)
 
+        # Build the engines concurrently. Most of the ~2min per-engine cost is
+        # XLA compilation and weight loading, which release the GIL, so this
+        # turns dp_size sequential compiles into roughly one.
         t0 = time.perf_counter()
-        self.engines: List[vLLMEngineCore] = []
-        for rank in range(self.dp_size):
-            logger.info("Mesh-based DP | building engine for rank %d/%d", rank,
-                        self.dp_size)
-            self.engines.append(
-                vLLMEngineCore(
+        built: List[Optional[vLLMEngineCore]] = [None] * self.dp_size
+        errors: List[BaseException] = []
+
+        def build(rank: int) -> None:
+            _building.rank = rank
+            try:
+                built[rank] = vLLMEngineCore(
                     vllm_config,
                     MeshDPExecutor,
                     log_stats,
                     executor_fail_callback,
                     include_finished_set,
-                ))
+                )
+            except BaseException as e:  # noqa: BLE001 - re-raised below
+                logger.exception("Mesh-based DP | rank %d failed to build",
+                                 rank)
+                errors.append(e)
+            finally:
+                _building.rank = None
+
+        builders = [
+            threading.Thread(target=build, args=(r, ), name=f"mesh-dp-build-{r}")
+            for r in range(self.dp_size)
+        ]
+        for t in builders:
+            t.start()
+        for t in builders:
+            t.join()
+        if errors:
+            raise errors[0]
+
+        self.engines: List[vLLMEngineCore] = [e for e in built if e is not None]
+        if len(self.engines) != self.dp_size:
+            raise RuntimeError(
+                f"Mesh-based DP built {len(self.engines)} of {self.dp_size} "
+                f"engines")
         logger.info("Mesh-based DP | %d engines ready in %.1fs", self.dp_size,
                     time.perf_counter() - t0)
+
+        prev = sys.getswitchinterval()
+        sys.setswitchinterval(_SWITCH_INTERVAL_S)
+        logger.info("Mesh-based DP | GIL switch interval %.4fs -> %.4fs", prev,
+                    _SWITCH_INTERVAL_S)
 
         # --- vLLM-facing attributes normally set by EngineCore.__init__ ---
         first = self.engines[0]
