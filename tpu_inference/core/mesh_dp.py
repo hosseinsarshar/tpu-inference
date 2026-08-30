@@ -251,32 +251,63 @@ class _SchedulerProxy:
             e.scheduler.shutdown()
 
 
+# How much wall time one queued prefill token costs relative to one queued
+# decode token. Prefill runs the whole prompt through as a single batched
+# matmul, decode runs one token per step, so a prefill token is worth roughly
+# (decode tok/s) / (prefill tok/s) of a decode token. Measured on Qwen3-0.6B at
+# DP=8: ~3k decode tok/s/chip against ~60k prefill tok/s/chip.
+#
+# The exact value is not critical -- what matters is that it is well below 1, so
+# that a long prompt cannot outweigh the decode backlog a request commits the
+# rank to. Setting it to 1 reproduces the old prefill-only behaviour.
+_PREFILL_TOKEN_WEIGHT = 0.05
+
+
 class _RankRouter:
     """Least-loaded routing over the DP ranks.
 
     Load is tracked here rather than read off the rank schedulers: a scheduler
     is owned by its rank thread, and walking its queues from the routing thread
-    would be a data race. The two counters are maintained from the two events
-    the router can observe locally -- a request being routed, and a request's
-    first token / final token coming back.
+    would be a data race. The counters are maintained from the events the router
+    can observe locally -- a request being routed, its first token, each token
+    after that, and its last.
 
-    ``prefill_owed`` (prompt tokens not yet prefilled) is the primary key
-    because prefill is what actually saturates a rank; in-flight request count
-    breaks ties so decode-heavy ranks do not keep collecting new work.
+    Load is scored as *estimated remaining work in decode-token equivalents*:
+
+        score = decode_owed + _PREFILL_TOKEN_WEIGHT * prefill_owed
+
+    Earlier this ranked on ``prefill_owed`` alone, which broke badly on
+    decode-heavy traffic. Prefill backlog drains in milliseconds and is zeroed
+    asynchronously by ``on_prefilled``, so during a burst of arrivals the
+    counter kept collapsing back to 0 for whichever rank had just prefilled and
+    that rank promptly attracted the next request -- a positive feedback loop.
+    Routing 256 identical 200-in/4000-out requests over 8 ranks produced a
+    9/10/32/33/38/39/43/52 split instead of 32 each, and the run ended with one
+    rank decoding alone while the other seven idled.
+
+    ``decode_owed`` is the fix: a request commits its rank for however many
+    tokens it will generate, and that is the quantity that has to be equalised.
     """
 
     def __init__(self, dp_size: int):
         self._lock = threading.Lock()
         self._prefill_owed = [0] * dp_size
+        self._decode_owed = [0] * dp_size
         self._inflight = [0] * dp_size
         self._dp_size = dp_size
 
-    def pick(self, num_tokens: int) -> int:
+    def _score(self, rank: int) -> float:
+        return (self._decode_owed[rank] +
+                _PREFILL_TOKEN_WEIGHT * self._prefill_owed[rank])
+
+    def pick(self, num_prompt_tokens: int, num_decode_tokens: int) -> int:
         with self._lock:
-            rank = min(
-                range(self._dp_size),
-                key=lambda r: (self._prefill_owed[r], self._inflight[r], r))
-            self._prefill_owed[rank] += num_tokens
+            # Rank index last so an all-idle router still fills r0, r1, ... in
+            # order rather than picking arbitrarily.
+            rank = min(range(self._dp_size),
+                       key=lambda r: (self._score(r), self._inflight[r], r))
+            self._prefill_owed[rank] += num_prompt_tokens
+            self._decode_owed[rank] += num_decode_tokens
             self._inflight[rank] += 1
             return rank
 
@@ -285,13 +316,23 @@ class _RankRouter:
             self._prefill_owed[rank] = max(
                 0, self._prefill_owed[rank] - num_tokens)
 
-    def on_finished(self, rank: int) -> None:
+    def on_decoded(self, rank: int, num_tokens: int) -> None:
+        with self._lock:
+            self._decode_owed[rank] = max(
+                0, self._decode_owed[rank] - num_tokens)
+
+    def on_finished(self, rank: int, decode_left: int = 0) -> None:
+        """Release a request. ``decode_left`` is the backlog it never spent --
+        non-zero when it stopped early on EOS or was aborted."""
         with self._lock:
             self._inflight[rank] = max(0, self._inflight[rank] - 1)
+            self._decode_owed[rank] = max(0,
+                                          self._decode_owed[rank] - decode_left)
 
-    def snapshot(self) -> Tuple[List[int], List[int]]:
+    def snapshot(self) -> Tuple[List[int], List[int], List[int]]:
         with self._lock:
-            return list(self._prefill_owed), list(self._inflight)
+            return (list(self._prefill_owed), list(self._inflight),
+                    list(self._decode_owed))
 
 
 class MeshDPEngineCore(vLLMEngineCore):
@@ -403,6 +444,9 @@ class MeshDPEngineCore(vLLMEngineCore):
         # Prompt-token count per request, needed to undo the router's
         # prefill-owed charge once the request's prefill actually lands.
         self._req_prompt_tokens: Dict[str, int] = {}
+        # Output tokens a request still owes its rank, so the router can drop
+        # the right amount of backlog when it finishes or is aborted early.
+        self._req_decode_left: Dict[str, int] = {}
         self._prefilled: set[str] = set()
 
         # Lightweight throughput accounting, logged periodically from step().
@@ -410,7 +454,11 @@ class MeshDPEngineCore(vLLMEngineCore):
             "steps": 0,
             "busy_s": 0.0,
             "idle": 0,
-            "toks": 0
+            "toks": 0,
+            # Requests routed here in the window. A rank that goes idle while
+            # peers are still working is either under-routed or slow, and only
+            # this counter separates the two.
+            "routed": 0,
         } for _ in range(self.dp_size)]
         self._outer = {"calls": 0, "empty": 0, "wait_s": 0.0}
         self._last_report = time.perf_counter()
@@ -450,7 +498,11 @@ class MeshDPEngineCore(vLLMEngineCore):
                 logger.exception("Mesh-based DP rank %d failed draining inbox",
                                  rank)
 
-            if not engine.scheduler.has_requests():
+            # Mirrors EngineCoreProc.has_work(): under async scheduling a rank
+            # can hold a dispatched-but-unharvested batch after the scheduler
+            # has already let go of its requests, and parking then would strand
+            # it. No-op while batch_queue is None.
+            if not engine.scheduler.has_requests() and not engine.batch_queue:
                 # Park on the inbox rather than spinning, so an idle rank
                 # costs no CPU and steals no GIL time from busy ranks.
                 st["idle"] += 1
@@ -511,19 +563,36 @@ class MeshDPEngineCore(vLLMEngineCore):
         """Update router load counters from a rank's own outputs."""
         for out in eco.outputs:
             rid = out.request_id
-            if out.new_token_ids and rid not in self._prefilled:
+            num_new = len(out.new_token_ids) if out.new_token_ids else 0
+            if num_new and rid not in self._prefilled:
                 # First sampled token => this request's prefill is done, so it
                 # no longer contributes to the rank's prefill backlog.
                 self._prefilled.add(rid)
                 self._router.on_prefilled(
                     rank, self._req_prompt_tokens.get(rid, 0))
+            if num_new:
+                # Retire the decode backlog as it is actually spent, so a rank
+                # that is nearly done stops looking as loaded as one that just
+                # started the same request.
+                left = self._req_decode_left.get(rid)
+                if left:
+                    spent = min(left, num_new)
+                    self._req_decode_left[rid] = left - spent
+                    self._router.on_decoded(rank, spent)
             if out.finish_reason is not None:
-                self._router.on_finished(rank)
+                if rid not in self._prefilled:
+                    # Finished without ever emitting a token, so the prefill
+                    # charge from add_request is still outstanding.
+                    self._router.on_prefilled(
+                        rank, self._req_prompt_tokens.get(rid, 0))
+                self._router.on_finished(rank,
+                                         self._req_decode_left.get(rid, 0))
                 self._forget_request(rid, rank)
 
     def _forget_request(self, rid: str, rank: int) -> None:
         self._prefilled.discard(rid)
         self._req_prompt_tokens.pop(rid, None)
+        self._req_decode_left.pop(rid, None)
         with self._req_rank_lock:
             self._req_rank.pop(rid, None)
 
@@ -533,10 +602,18 @@ class MeshDPEngineCore(vLLMEngineCore):
 
     def add_request(self, request: Request, request_wave: int = 0) -> None:
         num_tokens = request.num_tokens
-        rank = self._router.pick(num_tokens)
+        # max_tokens is an upper bound (the request may stop early on EOS), but
+        # it is the only forward-looking estimate available at routing time and
+        # it is exact for the fixed-length case. on_decoded/on_finished correct
+        # the backlog as the request actually progresses.
+        sampling_params = getattr(request, "sampling_params", None)
+        num_decode_tokens = getattr(sampling_params, "max_tokens", None) or 0
+        rank = self._router.pick(num_tokens, num_decode_tokens)
+        self._stats[rank]["routed"] += 1
         with self._req_rank_lock:
             self._req_rank[request.request_id] = rank
         self._req_prompt_tokens[request.request_id] = num_tokens
+        self._req_decode_left[request.request_id] = num_decode_tokens
         self._in_q[rank].put_nowait(("add", request, request_wave))
 
     def abort_requests(self, request_ids: List[str]) -> None:
@@ -547,6 +624,16 @@ class MeshDPEngineCore(vLLMEngineCore):
                 if rank is not None:
                     by_rank.setdefault(rank, []).append(rid)
         for rank, rids in by_rank.items():
+            # An aborted request never produces a finish_reason through
+            # _account, so release its router load here or the rank looks
+            # permanently busier than it is and stops being picked.
+            for rid in rids:
+                if rid not in self._prefilled:
+                    self._router.on_prefilled(
+                        rank, self._req_prompt_tokens.get(rid, 0))
+                self._router.on_finished(rank,
+                                         self._req_decode_left.get(rid, 0))
+                self._forget_request(rid, rank)
             self._in_q[rank].put_nowait(("abort", rids))
 
     def step(self) -> Tuple[Dict[int, EngineCoreOutputs], bool]:
@@ -582,16 +669,18 @@ class MeshDPEngineCore(vLLMEngineCore):
             return
         dt = now - self._last_report
         self._last_report = now
+        owed, inflight, dec = self._router.snapshot()
         per_rank = " | ".join(
             f"r{r}: {s['steps']}st {s['busy_s']:.2f}s busy "
-            f"{s['toks']}tok {s['idle']}idle"
+            f"{s['toks']}tok {s['idle']}idle "
+            f"+{s['routed']}rt {inflight[r]}fl {owed[r]}powed {dec[r]}dowed"
             for r, s in enumerate(self._stats))
         logger.info(
             "Mesh-DP %.1fs window | outer: %d calls %d empty %.2fs waiting | "
             "%s", dt, self._outer["calls"], self._outer["empty"],
             self._outer["wait_s"], per_rank)
         for s in self._stats:
-            s.update(steps=0, busy_s=0.0, idle=0, toks=0)
+            s.update(steps=0, busy_s=0.0, idle=0, toks=0, routed=0)
         self._outer.update(calls=0, empty=0, wait_s=0.0)
 
     @staticmethod
