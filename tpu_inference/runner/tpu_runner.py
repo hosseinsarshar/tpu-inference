@@ -162,6 +162,28 @@ REASON_KV_CACHE_LIMIT = "kv_cache_limit"
 REASON_UNKNOWN = "unknown"
 
 
+@functools.lru_cache(maxsize=8)
+def _pick_last_step_tokens(static_max_decode_steps: int):
+    """Gather each row's token at its own final decode step, in one dispatch.
+
+    Written eagerly this is four dispatches (subtract, clip, arange, gather)
+    plus a fresh `jnp.arange` allocation, issued once per rank per host step --
+    and mesh-based DP multiplies every per-step dispatch by dp_size.
+
+    Cached on `static_max_decode_steps` because it is baked in as the clip bound.
+    """
+
+    @jax.jit
+    def pick(generated_tokens: jax.Array,
+             step_counter: jax.Array) -> jax.Array:
+        last_step_idx = jnp.clip(step_counter - 1, 0,
+                                 static_max_decode_steps - 1)
+        return generated_tokens[last_step_idx,
+                                jnp.arange(generated_tokens.shape[1])]
+
+    return pick
+
+
 def _log_continue_decode_summary(
     actual_steps: int,
     max_decode_steps: int,
@@ -1846,11 +1868,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             self.rng_params_for_sampling = final_rng
             self.kv_caches = final_kv_caches
 
-            last_step_idx = jnp.clip(final_state.step_counter - 1, 0,
-                                     self.static_max_decode_steps - 1)
-            next_tokens_in_tpu = generated_tokens[
-                last_step_idx,
-                jnp.arange(generated_tokens.shape[1])]
+            next_tokens_in_tpu = _pick_last_step_tokens(
+                self.static_max_decode_steps)(generated_tokens,
+                                              final_state.step_counter)
 
             generated_tokens_async = jax.copy_to_host_async(generated_tokens)
             actual_steps_async = jax.copy_to_host_async(
@@ -2556,9 +2576,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         idx_pad_len = len(input) - len(token_in_tpu_cur_input_indices)
 
         # Pad according to the instructions written inside self._substitute_placeholder_token_fn
-        full_range = np.arange(0, len(input), dtype=np.int32)
-        missing_values = np.setdiff1d(full_range,
-                                      token_in_tpu_cur_input_indices)
+        # np.setdiff1d sorts and uniques both operands. These are already
+        # in-range indices into `input`, so a boolean mask yields the identical
+        # ascending result in O(n) instead. Profiling put setdiff1d/_unique1d at
+        # ~4% of on-CPU rank-thread time, paid once per rank per step.
+        mask = np.ones(len(input), dtype=bool)
+        mask[token_in_tpu_cur_input_indices] = False
+        missing_values = np.flatnonzero(mask).astype(np.int32)
         padded_token_in_tpu_cur_input_indices = np.concatenate(
             (token_in_tpu_cur_input_indices, missing_values))
 
@@ -3134,11 +3158,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 input_ids, next_tokens, token_in_tpu_cur_input_indices,
                 token_in_tpu_pre_next_tokens_indices)
 
-        num_scheduled_tokens_per_req = np.concatenate([
-            np.array(scheduled_tokens_per_dp_rank[dp_rank], dtype=np.int32)
-            for dp_rank in range(dp_size)
-        ])
         if self.lora_config is not None:
+            # Built inside the branch: `set_active_loras` is its only consumer,
+            # so with LoRA disabled this concatenate was pure per-step waste.
+            num_scheduled_tokens_per_req = np.concatenate([
+                np.array(scheduled_tokens_per_dp_rank[dp_rank], dtype=np.int32)
+                for dp_rank in range(dp_size)
+            ])
             self.lora_utils.set_active_loras(
                 num_scheduled_tokens_per_req,
                 total_num_scheduled_tokens,

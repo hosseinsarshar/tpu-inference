@@ -31,6 +31,26 @@ DEFAULT_SAMPLING_PARAMS = dict(
 )
 
 
+@functools.lru_cache(maxsize=32)
+def _cached_collision_dummy(mesh: Mesh, size: int) -> jax.Array:
+    """The compile-cache discriminator array, built once per (mesh, size).
+
+    Its *shape* is the only thing that matters: it gives each logprobs config a
+    distinct compile-cache key. The contents are never read, so the array is a
+    constant and rebuilding plus re-transferring it every step is pure waste --
+    one device_put per rank per step, which mesh-based DP multiplies by dp_size.
+
+    Keyed on the mesh (hashable, and one per rank under mesh-based DP) so each
+    rank keeps the dummy on its own devices.
+    """
+    return device_array(
+        mesh,
+        np.zeros((size, ), dtype=np.int32),
+        # Use replicated sharding for dummy tensor.
+        sharding=jax.sharding.NamedSharding(mesh,
+                                            jax.sharding.PartitionSpec()))
+
+
 @functools.partial(
     jax.tree_util.register_dataclass,
     data_fields=[
@@ -63,14 +83,8 @@ class TPUSupportedSamplingMetadata:
 
         # Use a dummy tensor with a unique shape for each logprobs config.
         # This avoids persistent cache collisions.
-        dummy_shape = (1 if needs_logprobs else 2, )
-        cache_collision_dummy = np.zeros(dummy_shape, dtype=np.int32)
-        # Use replicated sharding for dummy tensor.
-        cache_collision_dummy = device_array(
-            mesh,
-            cache_collision_dummy,
-            sharding=jax.sharding.NamedSharding(mesh,
-                                                jax.sharding.PartitionSpec()))
+        cache_collision_dummy = _cached_collision_dummy(
+            mesh, 1 if needs_logprobs else 2)
 
         if input_batch.all_greedy:
             return cls(do_sampling=False,
