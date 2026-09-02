@@ -318,6 +318,40 @@ class TpuPlatform(Platform):
                     os.environ["TPU_MULTIPROCESS_DP"])
 
     @classmethod
+    def _resolve_mesh_dp_multiprocessing(cls, vllm_config: VllmConfig) -> None:
+        """Keep the offline mesh-DP engine in the caller's process.
+
+        Mesh DP runs correctly either way now that the engine core class is
+        chosen through the platform: online serving gets
+        `MeshDPEngineCoreProc` in the engine process, offline gets
+        `MeshDPEngineCore` in-process. Offline is pinned to in-process anyway
+        because that is what the offline harness measures and profiles -- all
+        `dp_size` ranks in one address space, one profiler, no IPC hop.
+        """
+        from tpu_inference.core import mesh_dp
+        if not mesh_dp.is_mesh_dp_enabled(vllm_config):
+            return
+        online_serving = getattr(vllm_config.parallel_config,
+                                 "_api_process_rank", 0) == -1
+        if online_serving or not vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING:
+            return
+        logger.info("Mesh-based DP: disabling V1 multiprocessing so the "
+                    "offline engine is built in this process.")
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING = False
+
+    @classmethod
+    def get_engine_core_class(cls, vllm_config: VllmConfig,
+                              default_cls: type) -> type:
+        """Substitute the mesh-DP engine core when mesh-based DP is on.
+
+        Mesh DP puts `mesh_dp_size` independent engines behind one engine
+        core, so it replaces the engine core rather than the executor.
+        """
+        from tpu_inference.core import mesh_dp
+        return mesh_dp.get_engine_core_class(vllm_config, default_cls)
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
 
         cls._resolve_multiprocess_dp(vllm_config)
@@ -336,24 +370,7 @@ class TpuPlatform(Platform):
                     "variable to be set and DP attention set via: --additional_config \'{\"sharding\": {\"sharding_strategy\": {\"enable_dp_attention\": true}}}\'"
                 )
         cls._initialize_sharding_config(vllm_config)
-
-        # Mesh-based DP replaces vLLM's EngineCore with one that owns a
-        # separate engine (and mesh) per rank. Install it once the sharding
-        # config exists, since that is what records the per-rank mesh size.
-        from tpu_inference.core import mesh_dp
-        if mesh_dp.is_mesh_dp_enabled(vllm_config):
-            # `EngineCoreProc` subclasses `EngineCore`, so it binds the base
-            # class at definition time and the swap below cannot reach it.
-            # Running the engine in-process is also the point of mesh DP: all
-            # ranks share one address space. Online `vllm serve` will need a
-            # dedicated `MeshDPEngineCoreProc` instead.
-            if vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING:
-                logger.info(
-                    "Mesh-based DP: disabling V1 multiprocessing so the "
-                    "engine is built in this process.")
-                os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-                vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING = False
-            mesh_dp.install()
+        cls._resolve_mesh_dp_multiprocessing(vllm_config)
 
         cache_config = vllm_config.cache_config
         # The TPU hybrid (mamba/linear-attention) path does not support

@@ -70,6 +70,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.core import EngineCore as vLLMEngineCore
+from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.request import Request
 from vllm.v1.worker.worker_base import WorkerWrapperBase
@@ -237,6 +238,39 @@ class _SchedulerProxy:
     def get_kv_connector(self):
         return self._engines[0].scheduler.get_kv_connector()
 
+    def get_kv_cache_usage(self) -> float:
+        # A fraction, not a count: each rank owns a private KV cache of the
+        # same size, so the aggregate utilisation is their mean.
+        return sum(e.scheduler.get_kv_cache_usage()
+                   for e in self._engines) / len(self._engines)
+
+    def get_kv_event_publisher_config(self):
+        # Read off the startup handshake (`_make_ready_response`). Every rank
+        # is built from the same VllmConfig, so rank 0 speaks for all of them.
+        return self._engines[0].scheduler.get_kv_event_publisher_config()
+
+    def finish_requests(self, request_ids, finished_status) -> List[Request]:
+        # A request lives on exactly one rank, but the caller does not know
+        # which. Broadcasting is safe: a scheduler skips ids it does not own.
+        # `None` means "everything", which every rank must act on anyway.
+        if isinstance(request_ids, str):
+            request_ids = (request_ids, )
+        elif request_ids is not None:
+            request_ids = list(request_ids)
+        finished: List[Request] = []
+        for e in self._engines:
+            finished.extend(
+                e.scheduler.finish_requests(request_ids, finished_status))
+        return finished
+
+    @property
+    def pause_state(self):
+        return self._engines[0].scheduler.pause_state
+
+    def set_pause_state(self, pause_state) -> None:
+        for e in self._engines:
+            e.scheduler.set_pause_state(pause_state)
+
     def reset_prefix_cache(self, *args, **kwargs) -> bool:
         return all(
             e.scheduler.reset_prefix_cache(*args, **kwargs)
@@ -260,7 +294,13 @@ class _SchedulerProxy:
 # The exact value is not critical -- what matters is that it is well below 1, so
 # that a long prompt cannot outweigh the decode backlog a request commits the
 # rank to. Setting it to 1 reproduces the old prefill-only behaviour.
-_PREFILL_TOKEN_WEIGHT = 0.05
+#
+# Overridable so the value can be swept: it is a cost ratio between two phases
+# whose relative speed depends on the model, the chip and whether
+# continue_decode is on, and getting it wrong shows up as ranks draining at
+# different times rather than as an obviously wrong routing decision.
+_PREFILL_TOKEN_WEIGHT = float(
+    os.environ.get("TPU_MESH_DP_PREFILL_TOKEN_WEIGHT", "0.05"))
 
 
 class _RankRouter:
@@ -426,6 +466,9 @@ class MeshDPEngineCore(vLLMEngineCore):
         # Set by EngineCore.__init__ and read by inherited helpers; the rank
         # engines own the real queues, these just keep the base class happy.
         self.aborts_queue = queue.Queue()
+        # Drained by `EngineCoreProc._notify_idle_state_callbacks` on every
+        # pass of the busy loop, so it has to exist before serving starts.
+        self._idle_state_callbacks: List[Callable] = []
         self.is_ec_consumer = first.is_ec_consumer
         self._pooler_config_logged = True
         self.use_spec_decode = first.use_spec_decode
@@ -818,27 +861,53 @@ class MeshDPEngineCore(vLLMEngineCore):
                 logger.exception("Error shutting down a mesh-DP rank engine")
 
 
-_INSTALLED = False
+class MeshDPEngineCoreProc(EngineCoreProc, MeshDPEngineCore):
+    """:class:`MeshDPEngineCore` for the online (`vllm serve`) path.
 
+    Deliberately empty. ``EngineCoreProc`` splits cleanly in two: its own
+    ``__init__`` owns the ZMQ handshake, the socket threads and the busy loop,
+    and it delegates everything about the engine itself to
+    ``super().__init__(vllm_config, executor_class, log_stats,
+    executor_fail_callback, include_finished_set)`` -- which is exactly
+    :class:`MeshDPEngineCore`'s signature.
 
-def install() -> None:
-    """Route ``EngineCore`` construction through :class:`MeshDPEngineCore`.
+    Listing the bases in this order makes the MRO
+    ``[MeshDPEngineCoreProc, EngineCoreProc, MeshDPEngineCore, EngineCore]``,
+    so that ``super()`` call lands on the mesh engine core instead of the stock
+    one, while every method the mesh core overrides (``step``, ``add_request``,
+    ``abort_requests``, ``shutdown``, the control-plane fan-outs) still wins
+    over the ``EngineCore`` versions. The Proc layer needs no changes and none
+    of its ~115 lines of setup are duplicated here.
 
-    ``vllm.v1.engine.core_client`` binds ``EngineCore`` at import time, so both
-    that name and the definition site have to be replaced.
+    Reversing the bases would not work: ``super()`` inside
+    ``EngineCoreProc.__init__`` resolves against the class *after*
+    ``EngineCoreProc`` in the MRO, so the mesh core has to sit behind it.
     """
-    global _INSTALLED
-    if _INSTALLED:
-        return
 
-    import vllm.v1.engine.core as vllm_core
 
-    vllm_core.EngineCore = MeshDPEngineCore
-    try:
-        import vllm.v1.engine.core_client as vllm_core_client
-        vllm_core_client.EngineCore = MeshDPEngineCore
-    except ImportError:  # pragma: no cover - core_client always exists
-        pass
+def get_engine_core_class(vllm_config: VllmConfig,
+                          default_cls: type) -> type:
+    """Pick the mesh-DP engine core matching ``default_cls``.
 
-    _INSTALLED = True
+    Wired up by ``TpuPlatform.get_engine_core_class``; see
+    ``vllm.platforms.interface.Platform.get_engine_core_class``.
+    """
+    if not is_mesh_dp_enabled(vllm_config):
+        return default_cls
+
+    if default_cls is EngineCoreProc:
+        return MeshDPEngineCoreProc
+    if default_cls is vLLMEngineCore:
+        return MeshDPEngineCore
+
+    # `DPEngineCoreProc` is the other branch of `run_engine_core`, taken for
+    # MoE models when vLLM owns the DP ranks itself. It overrides
+    # `add_request` and `shutdown`, which are two of the methods mesh DP
+    # relies on, so the mixin above would silently lose them. The two ways of
+    # owning DP ranks are mutually exclusive anyway -- mesh DP collapses
+    # `data_parallel_size` to 1 so this branch should be unreachable.
+    raise NotImplementedError(
+        f"Mesh-based DP has no engine core for {default_cls.__name__}. "
+        f"Mesh DP owns the data-parallel ranks itself and cannot be combined "
+        f"with vLLM-native data parallelism.")
     logger.info("Mesh-based DP installed: EngineCore -> MeshDPEngineCore")
