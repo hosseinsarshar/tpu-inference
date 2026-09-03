@@ -1824,7 +1824,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self._cd_chain_pending = False
         is_decode_only = self.input_batch.request_distribution[
             0] == self.input_batch.num_reqs
-        if is_decode_only and self.enable_continue_decode:
+        has_structured_output = getattr(scheduler_output,
+                                        "has_structured_output_requests",
+                                        False)
+        if (is_decode_only and self.enable_continue_decode
+                and not has_structured_output):
             if self._cd_gate_stats:
                 self._record_cd_gate("decode_only")
             return self._execute_continue_decode(scheduler_output)

@@ -80,6 +80,10 @@ from tpu_inference.logger import init_logger
 
 logger = init_logger(__name__)
 
+# Guards `install()`, which is reached from `check_and_update_config` and so
+# runs once per config built in a process.
+_INSTALLED = False
+
 # How long a rank thread parks on its input queue when it has nothing to do.
 _IDLE_POLL_S = 0.02
 # How long the outer step() waits for the first output before reporting back to
@@ -212,6 +216,33 @@ class _SchedulerProxy:
 
     def __init__(self, engines: List[vLLMEngineCore]):
         self._engines = engines
+        self._forwarded: set = set()
+
+    def __getattr__(self, name: str):
+        """Serve anything not classified below from rank 0's scheduler.
+
+        The explicit members are the ones whose mesh semantics differ from a
+        single scheduler's: they aggregate, fan out, or answer from rank 0 on
+        purpose. Everything else forwards rather than raising, so a vLLM bump
+        that adds a ``self.scheduler.<new>()`` call to the engine core keeps
+        working instead of dying with ``AttributeError`` inside the busy loop.
+
+        Forwarding is logged once per name because a *mutating* addition would
+        only take effect on rank 0, and silent partial behaviour is the exact
+        failure mode mesh DP has been bitten by before. Treat the warning as a
+        prompt to classify the new member here.
+        """
+        # Private names are never reached for from the engine core, and
+        # excluding them keeps a lookup during ``__init__`` from recursing.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        if name not in self._forwarded:
+            self._forwarded.add(name)
+            logger.warning(
+                "Mesh-based DP | scheduler.%s has no mesh-aware version; "
+                "serving it from rank 0 only. If it aggregates over ranks or "
+                "mutates state, add it to _SchedulerProxy.", name)
+        return getattr(self._engines[0].scheduler, name)
 
     def has_requests(self) -> bool:
         return any(e.scheduler.has_requests() for e in self._engines)
@@ -375,6 +406,24 @@ class _RankRouter:
                     list(self._decode_owed))
 
 
+# `EngineCore` attributes that are identical on every rank, so answering them
+# from rank 0 is exact rather than an approximation. Purely documentation for
+# `MeshDPEngineCore.__getattr__`: a name missing from this set is still served,
+# it just logs a warning first. Adding to it is how a reviewer records "yes,
+# rank 0 speaks for all of them".
+_RANK0_ATTRS = frozenset({
+    "model_executor",
+    "structured_output_manager",
+    "request_block_hasher",
+    "is_ec_consumer",
+    "use_spec_decode",
+    "check_for_draft_tokens",
+    "is_pooling_model",
+    "async_scheduling",
+    "available_gpu_memory_for_kv_cache",
+})
+
+
 class MeshDPEngineCore(vLLMEngineCore):
     """An ``EngineCore`` that fans out over one independent engine per mesh.
 
@@ -382,6 +431,12 @@ class MeshDPEngineCore(vLLMEngineCore):
     base ``__init__`` is deliberately not called: this object owns no executor,
     scheduler or KV cache of its own, it only owns the sub-engines and the
     threads that drive them.
+
+    Only the members whose mesh semantics differ from a single engine's are
+    defined here; everything else is inherited from ``EngineCore`` or, for
+    state the skipped ``__init__`` would have set, read off rank 0 by
+    :meth:`__getattr__`. That is what keeps this class from having to track
+    ``EngineCore``'s field list across vLLM bumps.
     """
 
     def __init__(
@@ -392,6 +447,9 @@ class MeshDPEngineCore(vLLMEngineCore):
         executor_fail_callback: Optional[Callable] = None,
         include_finished_set: bool = False,
     ):
+        # Read by `__getattr__`, so it has to exist before anything else can
+        # miss a lookup.
+        self._forwarded_attrs: set = set()
         self.vllm_config = vllm_config
         self.log_stats = log_stats
         self.dp_size = vllm_config.sharding_config.mesh_dp_size
@@ -453,30 +511,27 @@ class MeshDPEngineCore(vLLMEngineCore):
         logger.info("Mesh-based DP | GIL switch interval %.4fs -> %.4fs", prev,
                     _SWITCH_INTERVAL_S)
 
-        # --- vLLM-facing attributes normally set by EngineCore.__init__ ---
-        first = self.engines[0]
-        self.model_executor = first.model_executor
-        self.structured_output_manager = first.structured_output_manager
-        self.request_block_hasher = first.request_block_hasher
-        self.mm_receiver_cache = MULTIMODAL_REGISTRY.engine_receiver_cache_from_config(
-            vllm_config)
+        # --- vLLM-facing attributes whose mesh value is not rank 0's ---
+        # Everything else `EngineCore.__init__` would have set is read off
+        # rank 0 on demand; see `__getattr__`.
         self.scheduler = _SchedulerProxy(self.engines)
+        # The rank engines each own a real batch queue. This object never
+        # executes a batch itself, it only harvests, so it must not look like
+        # it has one.
         self.batch_queue = None
         self.batch_queue_size = 1
+        # Deserialising client requests happens here, before routing, so the
+        # cache belongs to this object rather than to any one rank.
+        self.mm_receiver_cache = (
+            MULTIMODAL_REGISTRY.engine_receiver_cache_from_config(vllm_config))
         # Set by EngineCore.__init__ and read by inherited helpers; the rank
         # engines own the real queues, these just keep the base class happy.
         self.aborts_queue = queue.Queue()
         # Drained by `EngineCoreProc._notify_idle_state_callbacks` on every
         # pass of the busy loop, so it has to exist before serving starts.
         self._idle_state_callbacks: List[Callable] = []
-        self.is_ec_consumer = first.is_ec_consumer
+        # The ranks each log their own pooler config; suppress this object's.
         self._pooler_config_logged = True
-        self.use_spec_decode = first.use_spec_decode
-        self.check_for_draft_tokens = first.check_for_draft_tokens
-        self.is_pooling_model = first.is_pooling_model
-        self.async_scheduling = first.async_scheduling
-        self.available_gpu_memory_for_kv_cache = (
-            first.available_gpu_memory_for_kv_cache)
         self._weight_version = "default"
         self.step_fn = self.step
 
@@ -519,6 +574,33 @@ class MeshDPEngineCore(vLLMEngineCore):
         ]
         for t in self._threads:
             t.start()
+
+    def __getattr__(self, name: str):
+        """Fall back to rank 0 for plain ``EngineCore`` attributes.
+
+        ``EngineCore.__init__`` never runs on this object -- it owns no
+        executor, scheduler or KV cache -- so the attributes it would have set
+        are missing. Reading them off rank 0, a fully-built ``EngineCore`` over
+        the same ``VllmConfig``, beats copying a list that silently rots every
+        time vLLM adds a field.
+
+        Only reached when normal lookup fails, so the methods this class
+        defines and the mesh-specific attributes set in ``__init__`` always
+        win. Names outside :data:`_RANK0_ATTRS` are logged once, since a field
+        that should have aggregated over ranks would otherwise be quietly
+        answered by one of them.
+        """
+        # `engines` is the first thing `__init__` sets that this depends on;
+        # before then, and for the pickle/copy dunders, fail normally.
+        if name.startswith("__") or "engines" not in self.__dict__:
+            raise AttributeError(name)
+        if name not in _RANK0_ATTRS and name not in self._forwarded_attrs:
+            self._forwarded_attrs.add(name)
+            logger.warning(
+                "Mesh-based DP | EngineCore.%s has no mesh-aware version; "
+                "reading it from rank 0. If it should aggregate over ranks, "
+                "set it in MeshDPEngineCore.__init__.", name)
+        return getattr(self.engines[0], name)
 
     # ------------------------------------------------------------------
     # Rank threads
@@ -884,30 +966,68 @@ class MeshDPEngineCoreProc(EngineCoreProc, MeshDPEngineCore):
     ``EngineCoreProc`` in the MRO, so the mesh core has to sit behind it.
     """
 
+    @staticmethod
+    def run_engine_core(*args, **kwargs):
+        """Child-process entrypoint, re-applying :func:`install` first.
 
-def get_engine_core_class(vllm_config: VllmConfig,
-                          default_cls: type) -> type:
-    """Pick the mesh-DP engine core matching ``default_cls``.
+        ``CoreEngineProcManager`` starts the child on whatever
+        ``vllm.v1.engine.core.EngineCoreProc`` is bound to, so once
+        :func:`install` has run this is that entrypoint. Under ``fork`` (the
+        vLLM default) the parent's patch is already inherited and the call
+        below is a no-op; under ``spawn`` the child re-imports vLLM clean and
+        this is the last point before vLLM's own ``run_engine_core`` looks
+        ``EngineCoreProc`` up as a module global.
+        """
+        install()
+        # Bound at import, so this is vLLM's original staticmethod, not ours.
+        return EngineCoreProc.run_engine_core(*args, **kwargs)
 
-    Wired up by ``TpuPlatform.get_engine_core_class``; see
-    ``vllm.platforms.interface.Platform.get_engine_core_class``.
-    """
-    if not is_mesh_dp_enabled(vllm_config):
-        return default_cls
 
-    if default_cls is EngineCoreProc:
-        return MeshDPEngineCoreProc
-    if default_cls is vLLMEngineCore:
-        return MeshDPEngineCore
-
-    # `DPEngineCoreProc` is the other branch of `run_engine_core`, taken for
-    # MoE models when vLLM owns the DP ranks itself. It overrides
-    # `add_request` and `shutdown`, which are two of the methods mesh DP
-    # relies on, so the mixin above would silently lose them. The two ways of
-    # owning DP ranks are mutually exclusive anyway -- mesh DP collapses
-    # `data_parallel_size` to 1 so this branch should be unreachable.
+def _reject_native_dp_engine_core(*args, **kwargs):
+    """Stand-in for ``DPEngineCoreProc``; see :func:`install`."""
     raise NotImplementedError(
-        f"Mesh-based DP has no engine core for {default_cls.__name__}. "
-        f"Mesh DP owns the data-parallel ranks itself and cannot be combined "
-        f"with vLLM-native data parallelism.")
-    logger.info("Mesh-based DP installed: EngineCore -> MeshDPEngineCore")
+        "Mesh-based DP owns the data-parallel ranks itself and cannot be "
+        "combined with vLLM-native data parallelism.")
+
+
+def install() -> None:
+    """Route vLLM's engine-core construction sites at the mesh engine cores.
+
+    vLLM builds the engine core in two places, and each resolves the class
+    from a *module global* at call time, which is what makes this work:
+
+    * Offline (``LLM(...)``): ``InprocClient.__init__`` calls ``EngineCore``,
+      resolved against ``vllm.v1.engine.core_client``'s own globals because of
+      its top-level ``from vllm.v1.engine.core import EngineCore``.
+    * Online (``vllm serve``): the engine lives in a child process whose
+      entrypoint ``CoreEngineProcManager`` reads out of
+      ``vllm.v1.engine.core`` at spawn time, and ``run_engine_core`` then
+      looks ``EngineCoreProc`` up in that same module to construct it.
+
+    Note what is deliberately *not* patched: ``vllm.v1.engine.core``'s own
+    ``EngineCore``. Rebinding that name is a no-op for serving, because
+    ``class EngineCoreProc(EngineCore)`` captured the original base object
+    when the module was imported -- long before any platform code runs. That
+    was the bug that made mesh DP silently serve on one chip.
+
+    ``DPEngineCoreProc`` is the other branch of ``run_engine_core``, taken for
+    MoE models when vLLM owns the DP ranks. Mesh DP collapses
+    ``data_parallel_size`` to 1, so the branch should be unreachable; it is
+    bound to a raising stub rather than left alone so that reaching it fails
+    loudly instead of quietly falling back to single-mesh execution.
+    """
+    global _INSTALLED
+    if _INSTALLED:
+        return
+
+    from vllm.v1.engine import core as core_mod
+    from vllm.v1.engine import core_client as core_client_mod
+
+    core_mod.EngineCoreProc = MeshDPEngineCoreProc
+    core_mod.DPEngineCoreProc = _reject_native_dp_engine_core
+    core_client_mod.EngineCore = MeshDPEngineCore
+
+    _INSTALLED = True
+    logger.info(
+        "Mesh-based DP installed: EngineCore -> MeshDPEngineCore, "
+        "EngineCoreProc -> MeshDPEngineCoreProc")
