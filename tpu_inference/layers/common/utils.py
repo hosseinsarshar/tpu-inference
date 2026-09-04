@@ -137,6 +137,20 @@ def general_device_put(tensor: jax.Array,
     `source_mesh` specifies the mesh on which the input tensor is currently located.
     """
 
+    if envs.TPU_MULTIHOST_BACKEND != "ray":
+        # `jax.device_put` already flattens a pytree and issues a single batched
+        # transfer, so tree_map-ing over the leaves below defeats that batching
+        # and costs one dispatch per leaf. That dispatch overhead is nearly
+        # independent of how much data moves, and mesh-based DP pays it once per
+        # rank per step, so it is multiplied by dp_size.
+        #
+        # Only the "ray" branch needs per-leaf treatment (it inspects each
+        # leaf's addressability), so the fast path is split out rather than
+        # folded into `_put`.
+        if layout is not None:
+            return jax.device_put(tensor, Format(layout, sharding))
+        return jax.device_put(tensor, sharding)
+
     def _put(t):
         multihost_backend = envs.TPU_MULTIHOST_BACKEND
         # If we are not in multi-host setup, or the tensor is not fully addressable,

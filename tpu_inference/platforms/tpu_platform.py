@@ -281,6 +281,26 @@ class TpuPlatform(Platform):
         incompatible = enable_dp_attention or vllm_envs.VLLM_TPU_USING_PATHWAYS
 
         requested = envs.TPU_MULTIPROCESS_DP
+
+        if envs.TPU_MESH_BASED_DP:
+            # Mesh-based DP is the other MPMD flavour: it keeps the ranks
+            # independent but isolates them with one `jax.sharding.Mesh` per
+            # rank inside a single process, instead of masking physical chips
+            # per process. The two cannot both own the DP ranks.
+            if requested:
+                raise ValueError(
+                    "TPU_MESH_BASED_DP=1 and TPU_MULTIPROCESS_DP=1 are "
+                    "mutually exclusive: both implement MPMD data "
+                    "parallelism. Pick one.")
+            if enable_dp_attention:
+                raise ValueError(
+                    "TPU_MESH_BASED_DP=1 is not supported with attention DP "
+                    "(enable_dp_attention).")
+            os.environ["TPU_MULTIPROCESS_DP"] = "0"
+            logger.info(
+                "Mesh-based DP requested; forcing TPU_MULTIPROCESS_DP=0")
+            return
+
         if requested is not None:
             if requested and incompatible:
                 raise ValueError(
@@ -296,6 +316,35 @@ class TpuPlatform(Platform):
                                              and not incompatible else "0")
         logger.info("Resolved TPU_MULTIPROCESS_DP=%s",
                     os.environ["TPU_MULTIPROCESS_DP"])
+
+    @classmethod
+    def _setup_mesh_dp(cls, vllm_config: VllmConfig) -> None:
+        """Install the mesh-DP engine cores; pin the offline path in-process.
+
+        Mesh DP puts `mesh_dp_size` independent engines behind one engine
+        core, so it replaces the engine core rather than the executor.
+        `mesh_dp.install()` handles both construction sites, online and
+        offline.
+
+        Offline is additionally pinned to in-process because that is what the
+        offline harness measures and profiles -- all `dp_size` ranks in one
+        address space, one profiler, no IPC hop. Online serving has no
+        in-process engine path, and does not need one.
+        """
+        from tpu_inference.core import mesh_dp
+        if not mesh_dp.is_mesh_dp_enabled(vllm_config):
+            return
+
+        mesh_dp.install()
+
+        online_serving = getattr(vllm_config.parallel_config,
+                                 "_api_process_rank", 0) == -1
+        if online_serving or not vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING:
+            return
+        logger.info("Mesh-based DP: disabling V1 multiprocessing so the "
+                    "offline engine is built in this process.")
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING = False
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
@@ -316,6 +365,7 @@ class TpuPlatform(Platform):
                     "variable to be set and DP attention set via: --additional_config \'{\"sharding\": {\"sharding_strategy\": {\"enable_dp_attention\": true}}}\'"
                 )
         cls._initialize_sharding_config(vllm_config)
+        cls._setup_mesh_dp(vllm_config)
 
         cache_config = vllm_config.cache_config
         # The TPU hybrid (mamba/linear-attention) path does not support

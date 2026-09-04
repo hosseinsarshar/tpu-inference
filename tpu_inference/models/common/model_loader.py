@@ -478,6 +478,17 @@ def get_flax_model(
     model_supports_spec_step = supports_kw(model_class.__call__,
                                            "spec_step_idx")
 
+    # NOTE: passing the parameter leaves as argument 0 is what makes mesh-based
+    # DP GIL-bound -- JAX revalidates every leaf's aval, sharding and layout on
+    # every dispatch while holding the GIL, and mesh DP pays that once per rank
+    # rather than once per step. Capturing the weights as closure constants
+    # instead does fix dispatch (131 -> 31 us/call, 12.4k -> 60.6k calls/s
+    # across 8 threads) but is not viable: XLA then serialises the weights into
+    # every executable, which made each persistent-cache entry 2.8 GB (148 GB
+    # over ~140 entries) and slowed compilation 3.5x (3.5s -> 12.3s per
+    # executable on a Qwen3-0.6B-shaped stack). An optimization_barrier on the
+    # captured arrays fixes lowering time but not compile time. Shortening the
+    # dispatch path has to happen below jax.jit, not by moving the weights.
     def wrapped_model_fn(*args, **kwargs):
         if not model_supports_spec_step:
             kwargs.pop("spec_step_idx", None)

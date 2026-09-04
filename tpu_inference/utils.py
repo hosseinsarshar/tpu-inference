@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import functools
 import time
 from collections import defaultdict
 from collections.abc import Sequence
@@ -542,11 +543,37 @@ class DeviceBuffer:
         self._sizes = []
 
     @staticmethod
-    def unpack_arrays(blob: jax.Array,
-                      metadata: DeviceBufferMetadata) -> Dict[str, jax.Array]:
+    @functools.partial(jax.jit, static_argnums=(1, 2))
+    def _split_blob(
+        blob: jax.Array,
+        metadata: DeviceBufferMetadata,
+        shardings: Optional[Tuple[Any, ...]] = None,
+    ) -> Tuple[jax.Array, ...]:
+        indices = tuple(np.cumsum(metadata.sizes)[:-1])
+        parts = tuple(jnp.split(blob, indices))
+        if shardings is None:
+            return parts
+        # A part shipped inside the blob inherits the blob's sharding, but the
+        # consumer's jit cache is keyed on the sharding it was precompiled
+        # with. Pinning each part back to its own spec keeps the downstream
+        # signature byte-identical to the unfused path.
+        return tuple(p if s is None else jax.lax.with_sharding_constraint(p, s)
+                     for p, s in zip(parts, shardings))
+
+    @staticmethod
+    def unpack_arrays(
+        blob: jax.Array,
+        metadata: DeviceBufferMetadata,
+        shardings: Optional[Tuple[Any, ...]] = None,
+    ) -> Dict[str, jax.Array]:
         """
         Unpack a 1D blob into a dictionary of arrays based on provided metadata.
+
+        `shardings`, if given, is one entry per key (None to leave a part
+        alone) and is applied inside the jit.
         """
-        indices = tuple(np.cumsum(metadata.sizes)[:-1])
-        parts = jnp.split(blob, indices)
-        return {key: parts[i] for i, key in enumerate(metadata.keys)}
+        # Under jit this is one dispatch; eagerly, `jnp.split` is one full
+        # primitive dispatch per part, and mesh DP pays that per rank per step
+        # behind a single GIL. The layout is static, so it is a free jit.
+        parts = DeviceBuffer._split_blob(blob, metadata, shardings)
+        return dict(zip(metadata.keys, parts))
