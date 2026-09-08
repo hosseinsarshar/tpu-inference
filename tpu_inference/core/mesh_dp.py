@@ -360,23 +360,47 @@ class _RankRouter:
     tokens it will generate, and that is the quantity that has to be equalised.
     """
 
-    def __init__(self, dp_size: int):
+    def __init__(self, dp_size: int, max_num_seqs: int = 0):
         self._lock = threading.Lock()
         self._prefill_owed = [0] * dp_size
         self._decode_owed = [0] * dp_size
         self._inflight = [0] * dp_size
         self._dp_size = dp_size
+        # Slot capacity is a hard constraint, not a preference: a rank already
+        # holding max_num_seqs requests cannot start another one however little
+        # work it owes, and the victim then waits for a whole decode to retire.
+        # The work score alone does not see this. Measured on 24k serve at
+        # dp8/tp1 (cap 28): one rank reached 41 in-flight, and in 84% of 2s
+        # windows some rank sat at cap while another had a free slot. The two
+        # baseline runs differed 7.6% vs 49.1% of windows over cap and their
+        # P99 TTFT differed 28.9s vs 116.8s. 0 disables the cap.
+        self._max_num_seqs = max_num_seqs
+        self._diverted = 0
 
     def _score(self, rank: int) -> float:
         return (self._decode_owed[rank] +
                 _PREFILL_TOKEN_WEIGHT * self._prefill_owed[rank])
 
+    def _best(self, ranks) -> int:
+        # Rank index last so an all-idle router still fills r0, r1, ... in
+        # order rather than picking arbitrarily.
+        return min(ranks, key=lambda r: (self._score(r), self._inflight[r], r))
+
     def pick(self, num_prompt_tokens: int, num_decode_tokens: int) -> int:
         with self._lock:
-            # Rank index last so an all-idle router still fills r0, r1, ... in
-            # order rather than picking arbitrarily.
-            rank = min(range(self._dp_size),
-                       key=lambda r: (self._score(r), self._inflight[r], r))
+            rank = self._best(range(self._dp_size))
+            if (self._max_num_seqs
+                    and self._inflight[rank] >= self._max_num_seqs):
+                free = [
+                    r for r in range(self._dp_size)
+                    if self._inflight[r] < self._max_num_seqs
+                ]
+                # All ranks full: the request must queue somewhere, so keep the
+                # work-score answer -- it is the shortest queue by remaining
+                # work, which is the best available choice.
+                if free:
+                    rank = self._best(free)
+                    self._diverted += 1
             self._prefill_owed[rank] += num_prompt_tokens
             self._decode_owed[rank] += num_decode_tokens
             self._inflight[rank] += 1
@@ -404,6 +428,13 @@ class _RankRouter:
         with self._lock:
             return (list(self._prefill_owed), list(self._inflight),
                     list(self._decode_owed))
+
+    def diverted(self) -> int:
+        """Picks the slot cap moved off a full rank. 0 across a whole run
+        means the cap never bound and this build is behaviourally identical to
+        the unpatched one -- check it before crediting the fix."""
+        with self._lock:
+            return self._diverted
 
 
 # `EngineCore` attributes that are identical on every rank, so answering them
@@ -536,7 +567,8 @@ class MeshDPEngineCore(vLLMEngineCore):
         self.step_fn = self.step
 
         # --- orchestration state ---
-        self._router = _RankRouter(self.dp_size)
+        self._router = _RankRouter(
+            self.dp_size, self.vllm_config.scheduler_config.max_num_seqs)
         self._req_rank: Dict[str, int] = {}
         self._req_rank_lock = threading.Lock()
         # Prompt-token count per request, needed to undo the router's
@@ -802,8 +834,8 @@ class MeshDPEngineCore(vLLMEngineCore):
             for r, s in enumerate(self._stats))
         logger.info(
             "Mesh-DP %.1fs window | outer: %d calls %d empty %.2fs waiting | "
-            "%s", dt, self._outer["calls"], self._outer["empty"],
-            self._outer["wait_s"], per_rank)
+            "%d diverted | %s", dt, self._outer["calls"], self._outer["empty"],
+            self._outer["wait_s"], self._router.diverted(), per_rank)
         for s in self._stats:
             s.update(steps=0, busy_s=0.0, idle=0, toks=0, routed=0)
         self._outer.update(calls=0, empty=0, wait_s=0.0)
