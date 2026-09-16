@@ -1237,12 +1237,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # same JAX worker id). Without a per-rank segment they collide on
             # the second-resolution timestamp dir and one rank's capture
             # overwrites another's.
-            dp_rank = self.parallel_config.data_parallel_index if envs.TPU_MULTIPROCESS_DP else 0
+            # Set for every DP rank under both MPMD flavours, and 0 otherwise.
+            dp_rank = self.parallel_config.data_parallel_index
             # Mesh DP puts every rank in ONE process as a thread, and the JAX
             # profiler is process-wide: the second rank to call start_trace
             # dies with "profiler is already active". One rank drives the
             # capture, and the trace still covers every chip in the process,
-            # so nothing is lost by letting the others sit it out.
+            # so nothing is lost by letting the others sit it out. Under MPMD
+            # each rank is its own process, so every rank wins its own claim
+            # and this is a no-op.
             if not runner_utils.claim_process_profiler():
                 logger.info(
                     "Phased profiling already claimed by another rank in this "

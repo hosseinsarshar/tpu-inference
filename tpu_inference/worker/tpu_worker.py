@@ -4,6 +4,7 @@ import math
 import os
 import re
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
@@ -34,6 +35,10 @@ from tpu_inference.offload.metrics import TPUKVCacheStatsLogger
 from tpu_inference.runner.tpu_runner import TPUModelRunner
 
 logger = init_logger(__name__)
+
+# See `TPUWorker.init_device`. Uncontended unless several workers share a
+# process, which only mesh DP does.
+_INIT_DEVICE_LOCK = threading.Lock()
 
 
 @dataclass
@@ -311,7 +316,24 @@ class TPUWorker(WorkerBase):
                     tpu_process_bounds="",
                     tpu_chips_per_process_bounds="",
                     tpu_visible_chips=""):
+        """Bring up this worker's devices.
 
+        Serialised process-wide. Almost everything below is global state --
+        TPU env vars, JAX's backend, torch.distributed's default process
+        group -- which is safe when there is one worker per process, as there
+        is under SPMD and multi-process DP. Mesh DP runs every rank as a
+        thread of one process, so without this lock the ranks race to
+        initialise the same default process group and one of them loses.
+        The expensive parts of startup, weight loading and XLA compilation,
+        happen in `load_model` and stay outside it.
+        """
+        with _INIT_DEVICE_LOCK:
+            self._init_device_locked(tpu_process_bounds,
+                                     tpu_chips_per_process_bounds,
+                                     tpu_visible_chips)
+
+    def _init_device_locked(self, tpu_process_bounds,
+                            tpu_chips_per_process_bounds, tpu_visible_chips):
         if (envs.TPU_MULTIPROCESS_DP
                 and self.parallel_config.pipeline_parallel_size == 1):
             self._setup_dp_chip_isolation()

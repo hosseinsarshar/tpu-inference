@@ -193,8 +193,7 @@ class ShardingConfigManager:
     def __init__(self,
                  sharding_strategy: ShardingStrategy,
                  device_indexes: Optional[List] = None,
-                 mm_encoder_tp_mode: str = "weights",
-                 mesh_dp_size: int = 1):
+                 mm_encoder_tp_mode: str = "weights"):
 
         self.sharding_strategy: ShardingStrategy = sharding_strategy
         self.device_indexes: Optional[List[int]] = device_indexes
@@ -203,10 +202,6 @@ class ShardingConfigManager:
         if device_indexes:
             assert self._total_devices == len(device_indexes)
         self.mm_encoder_tp_mode = mm_encoder_tp_mode
-        # Number of independent single-process DP ranks under mesh-based DP.
-        # Each rank owns `total_devices` devices, so the run needs
-        # `mesh_dp_size * total_devices` devices in total. 1 = disabled.
-        self.mesh_dp_size: int = mesh_dp_size
 
     @classmethod
     def from_vllm_config(cls,
@@ -223,19 +218,14 @@ class ShardingConfigManager:
         enable_dp_attention = sharding_strategy.get("enable_dp_attention",
                                                     False)
         # Both MPMD flavours run one independent engine per DP rank, so the
-        # per-rank mesh carries no `data` axis at all.
-        mesh_dp_size = 1
-        if envs.TPU_MESH_BASED_DP:
-            # `data_parallel_size` is collapsed to 1 further down, and this
-            # method runs again in any engine process that re-derives the
-            # config -- by then the requested rank count is gone. Record it in
-            # the environment, which does survive the process boundary.
-            recorded = int(os.environ.get("TPU_MESH_DP_SIZE", "0"))
-            mesh_dp_size = max(recorded, data_parallelism)
-            if mesh_dp_size > 1:
-                os.environ["TPU_MESH_DP_SIZE"] = str(mesh_dp_size)
-                data_parallelism = 1
-        if envs.TPU_MULTIPROCESS_DP:
+        # per-rank mesh carries no `data` axis at all. They are treated
+        # identically here: vLLM owns the ranks in both cases, so
+        # `parallel_config.data_parallel_size` is left alone and only the
+        # mesh's own data axis collapses. Mesh DP used to stash the rank count
+        # in TPU_MESH_DP_SIZE because it erased data_parallel_size and had to
+        # recover it later; it no longer erases it, so there is nothing to
+        # recover.
+        if envs.TPU_MESH_BASED_DP or envs.TPU_MULTIPROCESS_DP:
             data_parallelism = 1
         expert_parallelism = sharding_strategy.get("expert_parallelism", 1)
         sequence_parallelism = sharding_strategy.get("sequence_parallelism", 1)
@@ -324,7 +314,9 @@ class ShardingConfigManager:
             prefill_context_parallelism=prefill_context_parallelism)
 
         # Must override here to avoid vLLM spinning up multiple DP engines.
-        if (not envs.TPU_MULTIPROCESS_DP
+        # Both MPMD flavours *want* vLLM to spin them up -- multi-process DP as
+        # processes, mesh DP as threads -- so both are exempt.
+        if (not envs.TPU_MULTIPROCESS_DP and not envs.TPU_MESH_BASED_DP
                 and vllm_config.parallel_config.data_parallel_size > 1):
             vllm_config.parallel_config.data_parallel_size = 1
             vllm_config.parallel_config.data_parallel_rank = 0
@@ -335,8 +327,7 @@ class ShardingConfigManager:
         mm_encoder_tp_mode = vllm_config.additional_config.get(
             'mm-encoder-tp-mode', 'weights')
         cls.validate(vllm_config, sharding_strategy)
-        return cls(sharding_strategy, device_indexes, mm_encoder_tp_mode,
-                   mesh_dp_size)
+        return cls(sharding_strategy, device_indexes, mm_encoder_tp_mode)
 
     @classmethod
     def validate(cls, vllm_config, sharding_strategy):
