@@ -1238,6 +1238,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # the second-resolution timestamp dir and one rank's capture
             # overwrites another's.
             dp_rank = self.parallel_config.data_parallel_index if envs.TPU_MULTIPROCESS_DP else 0
+            # Mesh DP puts every rank in ONE process as a thread, and the JAX
+            # profiler is process-wide: the second rank to call start_trace
+            # dies with "profiler is already active". One rank drives the
+            # capture, and the trace still covers every chip in the process,
+            # so nothing is lost by letting the others sit it out.
+            if not runner_utils.claim_process_profiler():
+                logger.info(
+                    "Phased profiling already claimed by another rank in this "
+                    "process; this rank will not drive the profiler.")
+                return
             self.phase_based_profiler = runner_utils.PhasedBasedProfiler(
                 self.phased_profiling_dir, worker_rank=dp_rank)
 

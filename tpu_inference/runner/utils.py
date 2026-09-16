@@ -118,6 +118,23 @@ PHASED_PROFILER_TRACK_CONCURRENCY = False
 
 logger = init_logger(__name__)
 
+# The JAX profiler is process-wide, so only one runner per process may own it.
+# Under MPMD and SPMD that is automatic (one runner per process), but mesh DP
+# runs every DP rank as a thread of the same process and would otherwise have
+# rank 1 die on "profiler is already active".
+_PROFILER_CLAIM_LOCK = threading.Lock()
+_PROFILER_CLAIMED = False
+
+
+def claim_process_profiler() -> bool:
+    """True for the first caller in this process, False for every one after."""
+    global _PROFILER_CLAIMED
+    with _PROFILER_CLAIM_LOCK:
+        if _PROFILER_CLAIMED:
+            return False
+        _PROFILER_CLAIMED = True
+        return True
+
 
 class InferencePhase(Enum):
     PREFILL_HEAVY = 0
