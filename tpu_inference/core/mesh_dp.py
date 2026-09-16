@@ -46,15 +46,26 @@ stock busy loop; request routing, load balancing, wave/idle coordination and
 the whole ZMQ control plane are vLLM's own, unmodified. Two things are
 mesh-specific and nothing else is:
 
-1. ``CoreEngineThreadManager`` starts each rank on a ``threading.Thread``
-   rather than a ``multiprocessing.Process``. It matches
-   ``CoreEngineProcManager``'s constructor and its ``sentinels()`` /
-   ``finished_procs()`` / ``shutdown()`` surface, so ``launch_core_engines``
-   and ``wait_for_engine_startup`` drive it without knowing the difference.
+1. ``CoreEngineThreadManager`` spawns **one** engine-core child process and
+   starts all ``local_engine_count`` ranks inside it as threads, where
+   ``CoreEngineProcManager`` would have spawned one process per rank. It
+   subclasses that class and overrides only ``__init__``, so ``shutdown()``,
+   ``monitor_engine_liveness()``, ``sentinels()`` and ``finished_procs()``
+   are inherited verbatim and keep working over the single child.
 2. Each rank's ``VllmConfig`` copy carries its own
    ``sharding_config.device_indexes``. That is an existing, first-class field
    ``TPUWorker.init_device`` already honours (``tpu_worker.py:379``), and it
    is what pins the rank's mesh to its own chips.
+
+The child process is not an implementation detail. Threads are what make the
+ranks share one JAX client and one weights cache, but they also make every
+rank share a GIL with whatever else lives in that process -- and the process
+that calls ``launch_core_engines`` under ``vllm serve`` is the API server,
+running uvicorn, tokenization and detokenization. Hosting the ranks there
+would put the frontend on the engines' GIL. Spawning one child keeps the
+split the process path has: frontend in the parent, engines in a child.
+It also keeps ``jax.devices()`` out of the parent, which must stay free of an
+initialised TPU backend.
 
 ``install()`` therefore rebinds exactly one name. An earlier version of this
 module substituted the engine core itself -- ``MeshDPEngineCore``,
@@ -80,14 +91,18 @@ from __future__ import annotations
 
 import copy
 import os
+import signal
 import sys
 import threading
+import time
 import weakref
-from multiprocessing import connection
 from typing import Any, Dict, List, Optional
 
 import jax
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.utils.system_utils import get_mp_context
+from vllm.v1.engine.utils import CoreEngineProcManager, SignalCallback
+from vllm.v1.utils import shutdown as shutdown_processes
 
 from tpu_inference import envs
 from tpu_inference.logger import init_logger
@@ -104,10 +119,6 @@ _INSTALLED = False
 # queue -- with 8 ranks that convoy stretched single steps past two seconds.
 # A coarser interval lets a rank finish more of its step per acquisition.
 _SWITCH_INTERVAL_S = float(os.getenv("TPU_MESH_DP_SWITCH_INTERVAL", "0.05"))
-
-# How long `shutdown()` waits for a rank thread to leave its busy loop. Threads
-# cannot be killed, so this is a report-and-continue deadline, not a guarantee.
-_JOIN_TIMEOUT_S = 30.0
 
 
 def is_mesh_dp_enabled(vllm_config: VllmConfig) -> bool:
@@ -160,20 +171,17 @@ def assign_device_indexes(vllm_config: VllmConfig) -> List[List[int]]:
 
 
 class _RankThread:
-    """A rank thread wearing just enough of a ``Process``'s face.
+    """One rank's thread, with a ``Process``-shaped ``exitcode``.
 
-    ``wait_for_engine_startup`` registers ``proc.sentinel`` with a
-    ``zmq.Poller`` and ``monitor_engine_liveness`` passes it to
-    ``multiprocessing.connection.wait``, both of which want a file descriptor
-    that becomes readable when the rank dies. A thread has no such fd, so it
-    gets a pipe whose write end is closed on the way out -- same signal, same
-    poll, no special-casing in the caller.
+    The only reason this is not a bare ``threading.Thread`` is that a thread
+    that raises leaves no trace a caller can test. Recording an exit code lets
+    the group entrypoint decide the child process's own exit status the same
+    way ``CoreEngineProcManager`` reads one off a spawned rank.
     """
 
     def __init__(self, name: str, target, args: tuple):
         self.name = name
         self.exitcode: Optional[int] = None
-        self._r_fd, self._w_fd = os.pipe()
         self._thread = threading.Thread(target=self._run,
                                         args=(target, args),
                                         name=name,
@@ -186,13 +194,6 @@ class _RankThread:
         except BaseException:  # noqa: BLE001 - reported via exitcode
             logger.exception("Mesh-based DP | %s died", self.name)
             self.exitcode = 1
-        finally:
-            # Closing the write end is what wakes every poller watching this
-            # rank. Do it last, and do it exactly once.
-            try:
-                os.close(self._w_fd)
-            except OSError:
-                pass
 
     def start(self) -> None:
         self._thread.start()
@@ -203,28 +204,18 @@ class _RankThread:
     def is_alive(self) -> bool:
         return self._thread.is_alive()
 
-    @property
-    def sentinel(self) -> int:
-        return self._r_fd
-
-    def close_sentinel(self) -> None:
-        try:
-            os.close(self._r_fd)
-        except OSError:
-            pass
-
 
 def _run_rank(vllm_config: VllmConfig, rank: int, device_indexes: List[int],
-              engine_kwargs: Dict[str, Any],
-              built: threading.Semaphore) -> None:
+              engine_kwargs: Dict[str, Any], built: threading.Semaphore,
+              engines: List[Any]) -> None:
     """Build one stock ``EngineCoreProc`` and run its stock busy loop.
 
-    This is ``EngineCoreProc.run_engine_core`` with the three things a thread
-    cannot do removed -- ``signal.signal`` (main thread only),
-    ``set_process_title`` and ``decorate_logs`` (both process-global) -- and
-    nothing added. Shutdown arrives over ZMQ from the frontend exactly as it
-    does for a spawned rank, so the signal handling is not merely skipped, it
-    is unnecessary.
+    This is the body of ``EngineCoreProc.run_engine_core`` with the
+    process-global parts lifted out into :func:`_run_rank_group`: process
+    title, log decoration and signal handlers belong to the child's main
+    thread and are installed once for all ranks, not once per rank. What is
+    left -- the per-rank config, the engine build and the busy loop -- is
+    unchanged.
     """
     from vllm.v1.engine.core import EngineCoreProc
 
@@ -250,6 +241,9 @@ def _run_rank(vllm_config: VllmConfig, rank: int, device_indexes: List[int],
         engine = EngineCoreProc(vllm_config=cfg,
                                 engine_index=rank,
                                 **engine_kwargs)
+        # Publish before releasing, so that once the last rank is built the
+        # signal handler is guaranteed to see every engine.
+        engines.append(engine)
     finally:
         # Release the config holder whether or not the build worked, or a
         # failing rank would strand the other seven behind it.
@@ -263,14 +257,116 @@ def _run_rank(vllm_config: VllmConfig, rank: int, device_indexes: List[int],
         engine.shutdown()
 
 
-class CoreEngineThreadManager:
-    """``CoreEngineProcManager``, with threads.
+def _run_rank_group(vllm_config: VllmConfig, ranks: List[int],
+                    engine_kwargs: Dict[str, Any]) -> None:
+    """Child-process entrypoint: host ``ranks`` as threads and wait for them.
 
-    Constructor signature and public surface are copied from the upstream
-    class on purpose: ``launch_core_engines`` builds it by keyword and
-    ``wait_for_engine_startup`` reaches for ``sentinels()`` and
-    ``finished_procs()``, so matching it exactly is what lets the rest of the
-    DP machinery stay untouched.
+    Stands where ``EngineCoreProc.run_engine_core`` stands on the process
+    path, and does the same process-level setup it does -- register the
+    config serializer, set the process title, decorate logs, install SIGTERM
+    and SIGINT handlers -- once, for the group. Signals can only be caught on
+    the main thread, which is exactly why this function exists and the work is
+    not folded into :func:`_run_rank`.
+    """
+    from vllm.transformers_utils.config import \
+        maybe_register_config_serialize_by_value
+    from vllm.utils.system_utils import decorate_logs, set_process_title
+    from vllm.v1.engine import EngineCoreRequestType
+    from vllm.v1.engine.core import EngineShutdownState
+
+    maybe_register_config_serialize_by_value()
+    set_process_title(f"EngineCore_DP{ranks[0]}-{ranks[-1]}")
+    decorate_logs()
+
+    # One rank per thread means `len(ranks)` threads competing for a single
+    # GIL. See `_SWITCH_INTERVAL_S`. Set here rather than in the parent: the
+    # parent is the API server and has no reason to run coarse.
+    prev = sys.getswitchinterval()
+    sys.setswitchinterval(_SWITCH_INTERVAL_S)
+    logger.info("Mesh-based DP | GIL switch interval %.4fs -> %.4fs", prev,
+                _SWITCH_INTERVAL_S)
+
+    groups = assign_device_indexes(vllm_config)
+
+    # `_current_vllm_config` is a module-level global, not a thread-local, so
+    # concurrent builders clobber each other: one rank's `load_model` context
+    # exits and restores `None` while another is still in KV-cache init, which
+    # fails with "Current vLLM config is not set". Holding the shared parent
+    # config across the whole build makes every nested save/restore land on
+    # this object instead of on `None`. The per-rank copies differ only in
+    # device indexes and DP identity, neither of which is read through the
+    # global, so the ranks stay correct.
+    built = threading.Semaphore(0)
+    engines: List[Any] = []
+
+    threads = [
+        _RankThread(
+            name=f"EngineCore_DP{rank}",
+            target=_run_rank,
+            args=(vllm_config, rank, groups[rank], engine_kwargs, built,
+                  engines),
+        ) for rank in ranks
+    ]
+
+    def wakeup_engines() -> None:
+        # Not safe from a signal handler: it takes each input queue's
+        # non-reentrant mutex, which the interrupted thread may already hold.
+        for engine in list(engines):
+            engine.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+
+    signal_callback = SignalCallback(wakeup_engines)
+
+    def signal_handler(signum, frame):
+        logger.info("[shutdown] Mesh-based DP: received signal=%s",
+                    signal.Signals(signum).name)
+        for engine in list(engines):
+            engine.shutdown_state = EngineShutdownState.REQUESTED
+        signal_callback.trigger()
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    try:
+        started = time.monotonic()
+        with set_current_vllm_config(vllm_config):
+            for t in threads:
+                t.start()
+            for _ in threads:
+                built.acquire()
+        # The one line that proves mesh DP engaged, rather than the config
+        # having quietly fallen back to a single engine. Benchmark harnesses
+        # gate on it, so it has to stay stable.
+        logger.info("Mesh-based DP | %d engines ready in %.1fs", len(threads),
+                    time.monotonic() - started)
+        # Outside the config context: the build window is over, and holding it
+        # for the life of the busy loops would leak the parent config into
+        # anything that consults the global at request time.
+        for t in threads:
+            t.join()
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal_callback.stop()
+
+    failed = [t.name for t in threads if t.exitcode != 0]
+    if failed:
+        # Non-zero exit is how the parent's `monitor_engine_liveness` learns
+        # this was a crash and not a clean shutdown.
+        raise RuntimeError(f"Mesh-based DP rank(s) failed: {', '.join(failed)}")
+
+
+class CoreEngineThreadManager(CoreEngineProcManager):
+    """``CoreEngineProcManager`` that spawns one child for all local ranks.
+
+    Only ``__init__`` differs. Everything the rest of vLLM asks of this object
+    -- ``shutdown()``, ``monitor_engine_liveness()``, ``sentinels()``,
+    ``finished_procs()`` -- is inherited, because after construction
+    ``self.processes`` is an ordinary list of ``multiprocessing`` processes;
+    it just happens to have one entry instead of ``local_engine_count``.
+
+    Nothing upstream counts that list. ``wait_for_engine_startup`` waits for
+    one handshake per entry in ``core_engines``, and each rank thread performs
+    its own handshake, so the frontend still sees N engines come up.
     """
 
     def __init__(
@@ -305,105 +401,33 @@ class CoreEngineThreadManager:
         if client_handshake_address:
             engine_kwargs["client_handshake_address"] = client_handshake_address
 
-        prev = sys.getswitchinterval()
-        sys.setswitchinterval(_SWITCH_INTERVAL_S)
-        logger.info("Mesh-based DP | GIL switch interval %.4fs -> %.4fs", prev,
-                    _SWITCH_INTERVAL_S)
+        ranks = [start_index + i for i in range(local_engine_count)]
 
+        self._request_shutdown_timeout = vllm_config.shutdown_timeout
         self.manager_stopped = threading.Event()
         self.failed_proc_name: Optional[str] = None
 
-        # `_current_vllm_config` is a module-level global, not a thread-local,
-        # so concurrent builders clobber each other: one rank's `load_model`
-        # context exits and restores `None` while another is still in KV-cache
-        # init, which fails with "Current vLLM config is not set". Holding the
-        # shared parent config across the whole build makes every nested
-        # save/restore land on this object instead of on `None`. The per-rank
-        # copies differ only in device indexes and DP identity, neither of
-        # which is read through the global, so the ranks stay correct.
-        #
-        # This has to be held from a side thread rather than from __init__:
-        # each rank's `EngineCoreProc.__init__` blocks in its ZMQ handshake
-        # until the frontend answers, and the frontend does not answer until
-        # after this constructor returns.
-        built = threading.Semaphore(0)
-
-        groups = assign_device_indexes(vllm_config)
-        self.processes: List[_RankThread] = [
-            _RankThread(
-                name=f"EngineCore_DP{start_index + i}",
-                target=_run_rank,
-                args=(vllm_config, start_index + i,
-                      groups[start_index + i], engine_kwargs, built),
-            ) for i in range(local_engine_count)
+        # One child for all of them. `assign_device_indexes` runs inside it,
+        # so the TPU backend is initialised there and only there.
+        self.processes = [
+            get_mp_context().Process(
+                target=_run_rank_group,
+                name=f"EngineCore_DP{ranks[0]}-{ranks[-1]}",
+                kwargs={
+                    "vllm_config": vllm_config,
+                    "ranks": ranks,
+                    "engine_kwargs": engine_kwargs,
+                },
+            )
         ]
 
-        def hold_config() -> None:
-            with set_current_vllm_config(vllm_config):
-                for _ in self.processes:
-                    built.acquire()
-
-        self._config_holder = threading.Thread(target=hold_config,
-                                               name="mesh-dp-config-holder",
-                                               daemon=True)
-        self._config_holder.start()
-
-        self._finalizer = weakref.finalize(self, _shutdown_threads,
+        self._finalizer = weakref.finalize(self, shutdown_processes,
                                            self.processes)
-        for t in self.processes:
-            t.start()
-
-    def shutdown(self, timeout: Optional[float] = None) -> None:
-        self.manager_stopped.set()
-        finalizer = getattr(self, "_finalizer", None)
-        if finalizer is not None:
-            finalizer()
-
-    def monitor_engine_liveness(self) -> None:
-        """Mirror of the upstream method; see :class:`_RankThread`."""
-        sentinel_to_proc = {t.sentinel: t for t in self.processes}
-        sentinels = set(sentinel_to_proc)
-
-        while sentinels and not self.manager_stopped.is_set():
-            died = connection.wait(list(sentinels), timeout=1)
-            for sentinel in died:
-                sentinels.discard(sentinel)
-                proc = sentinel_to_proc.pop(sentinel, None)
-                if (proc is not None and proc.exitcode != 0
-                        and not self.manager_stopped.is_set()):
-                    self.failed_proc_name = proc.name
-            if died:
-                break
-
-        self.shutdown()
-
-    def sentinels(self) -> list:
-        return [t.sentinel for t in self.processes]
-
-    def finished_procs(self) -> Dict[str, int]:
-        return {
-            t.name: t.exitcode
-            for t in self.processes if t.exitcode is not None
-        }
-
-
-def _shutdown_threads(threads: List[_RankThread]) -> None:
-    """Wait for the rank threads to leave their busy loops.
-
-    A thread cannot be terminated, so unlike the process manager there is no
-    escalation to SIGKILL. The frontend has already sent the shutdown message
-    over ZMQ by the time this runs; all that is left is to notice whether the
-    ranks acted on it, and to say so if they did not.
-    """
-    for t in threads:
-        t.join(timeout=_JOIN_TIMEOUT_S)
-    stuck = [t.name for t in threads if t.is_alive()]
-    if stuck:
-        logger.warning(
-            "Mesh-based DP | %d rank thread(s) still running after %.0fs: %s",
-            len(stuck), _JOIN_TIMEOUT_S, ", ".join(stuck))
-    for t in threads:
-        t.close_sentinel()
+        try:
+            self.processes[0].start()
+        finally:
+            if self.finished_procs():
+                self.shutdown()
 
 
 def install() -> None:
