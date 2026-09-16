@@ -403,6 +403,26 @@ def sharded_splash_attention(
         ))
 
 
+def rpa_block_size_kwargs() -> dict[str, tuple[int, int, int, int]]:
+    """Optional RPA v3 block-size overrides from env, for the call site to
+    forward with ``**``.
+
+    The kernel is self-contained and never reads env, so every call site must
+    supply these (the vLLM-model path in layers/jax/attention/attention.py and
+    the MaxText path below). Without it the RPA_V3_*_BLOCK_SIZES vars are
+    silently ignored and the kernel falls back to get_default_block_sizes().
+    Each var is a comma-separated 4-tuple ``(bq_sz, bkv_sz, bq_csz, bkv_csz)``;
+    a key is included only when its var is non-empty, so the default call is
+    unchanged.
+    """
+    env_to_kwarg = {
+        "d_block_sizes": envs.RPA_V3_DECODE_BLOCK_SIZES,
+        "p_block_sizes": envs.RPA_V3_PREFILL_BLOCK_SIZES,
+        "m_block_sizes": envs.RPA_V3_MIXED_BLOCK_SIZES,
+    }
+    return {k: tuple(v) for k, v in env_to_kwarg.items() if v}
+
+
 def sharded_ragged_paged_attention(
     mesh: Mesh,
     q: jax.Array,
@@ -422,6 +442,7 @@ def sharded_ragged_paged_attention(
     update_kv_cache: bool = True,
     use_causal_mask: bool = True,
     attn_logits_soft_cap: float | None = None,
+    decode_query_size: int = 1,
 ):
     """Shards along KV heads."""
     # Handle GQA/MQA where num_kv_heads < tp_size
@@ -490,6 +511,12 @@ def sharded_ragged_paged_attention(
         if not use_hd64:
             kwargs["update_kv_cache"] = update_kv_cache
             kwargs["use_causal_mask"] = use_causal_mask
+            if envs.USE_BATCHED_RPA_KERNEL:
+                kwargs["decode_query_size"] = decode_query_size
+            else:
+                # RPA_V3_*_BLOCK_SIZES are v3-kernel knobs; the experimental
+                # batched kernel takes its own BlockSizes configs instead.
+                kwargs.update(rpa_block_size_kwargs())
         return func(*args, **kwargs)
 
     return jax.shard_map(
@@ -519,6 +546,7 @@ def attention(
     use_causal_mask: bool = True,
     shared_attention_metadata: SharedAttentionMetadata | None = None,
     attn_logits_soft_cap: float | None = None,
+    decode_query_size: int = 1,
 ) -> Tuple[jax.Array, jax.Array]:
     # T: seq_len
     # N: num_heads
@@ -572,7 +600,6 @@ def attention(
             update_kv_cache=update_kv_cache,
             use_causal_mask=use_causal_mask,
         )
-
     # (T, N, H)
     output, kv_cache = sharded_ragged_paged_attention(
         mesh,
@@ -593,6 +620,7 @@ def attention(
         update_kv_cache=update_kv_cache,
         use_causal_mask=use_causal_mask,
         attn_logits_soft_cap=attn_logits_soft_cap,
+        decode_query_size=decode_query_size,
     )
 
     return kv_cache, output

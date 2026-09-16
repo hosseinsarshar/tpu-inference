@@ -28,6 +28,7 @@ class TestTPUJaxRunnerDPInputsLightweight:
 
     def setup_method(self):
         self.runner = MagicMock()
+        self.runner.input_batch.max_decode_tokens = 1
 
         # Basic DP configuration
         self.runner.dp_size = 2
@@ -36,11 +37,14 @@ class TestTPUJaxRunnerDPInputsLightweight:
         self.runner.vllm_config.sharding_config.prefill_cp_size = 1
         self.runner.max_num_tokens = 64
         self.runner.max_num_reqs = 8
+        self.runner.attn_max_num_seqs = 8
         self.runner.max_num_blocks_per_req = 8
         self.runner.num_tokens_paddings = [16, 32, 64]
 
         # Mock input batch - adjust num_reqs to match test data
         self.runner.input_batch = MagicMock()
+        self.runner.input_batch.max_decode_tokens = 1
+        self.runner.input_batch.max_decode_tokens = 1
         self.runner.input_batch.num_reqs = 2
         self.runner.input_batch.req_ids = ["req1", "req2", "req3", "req4"]
         self.runner.input_batch.req_id_to_index = {
@@ -96,7 +100,8 @@ class TestTPUJaxRunnerDPInputsLightweight:
     def _create_mock_scheduler_output(self,
                                       num_scheduled_tokens_dict,
                                       assigned_dp_ranks,
-                                      scheduled_spec_decode_tokens=None):
+                                      scheduled_spec_decode_tokens=None,
+                                      has_structured_output_requests=False):
         """Create a minimal mock scheduler output."""
         mock_output = MagicMock()
         mock_output.num_scheduled_tokens = num_scheduled_tokens_dict
@@ -105,6 +110,7 @@ class TestTPUJaxRunnerDPInputsLightweight:
             num_scheduled_tokens_dict.values())
         mock_output.scheduled_spec_decode_tokens = scheduled_spec_decode_tokens or {}
         mock_output.grammar_bitmask = None
+        mock_output.has_structured_output_requests = has_structured_output_requests
         return mock_output
 
     def _create_mock_hybrid_kv_cache_config(self):
@@ -536,6 +542,52 @@ class TestTPUJaxRunnerDPInputsLightweight:
             assert isinstance(tokens_indices_selector, np.ndarray)
             np.testing.assert_array_equal(tokens_indices_selector,
                                           np.array([0, 1, 16, 17]))
+
+    def test_prepare_dp_input_metadata_continue_decode_with_structured_output(
+            self):
+        """Test continue decode is bypassed when structured output requests are present."""
+        num_scheduled_tokens = {"req1": 1, "req2": 1, "req3": 1, "req4": 1}
+        assigned_dp_ranks = {"req1": 0, "req2": 0, "req3": 1, "req4": 1}
+
+        self.runner.input_batch.num_reqs = 4
+        self.runner.input_batch.req_ids = ["req1", "req2", "req3", "req4"]
+        self.runner.max_num_reqs = 8
+        self.runner.enable_continue_decode = True
+
+        self.runner.input_batch.request_distribution = [4]
+
+        scheduler_output = self._create_mock_scheduler_output(
+            num_scheduled_tokens,
+            assigned_dp_ranks,
+            has_structured_output_requests=True)
+
+        with patch('tpu_inference.runner.tpu_runner.runner_utils'
+                   ) as mock_runner_utils:
+            self.runner.num_reqs_paddings_per_dp = [16]
+            self.runner.num_tokens_paddings_per_dp = [32]
+
+            def get_padded_token_len_side_effect(paddings, val):
+                if paddings == self.runner.num_reqs_paddings_per_dp:
+                    return 16
+                if paddings == self.runner.num_tokens_paddings_per_dp:
+                    return 32
+                return 64
+
+            mock_runner_utils.get_padded_token_len.side_effect = get_padded_token_len_side_effect
+
+            result = self.runner._prepare_input_metadata(scheduler_output)
+
+            (req_ids_dp, req_indices_dp, num_scheduled_tokens_per_dp_rank,
+             scheduled_tokens_per_dp_rank, num_req_per_dp_rank,
+             padded_num_scheduled_tokens_per_dp_rank, padded_num_reqs,
+             attn_padded_num_reqs, padded_total_num_scheduled_tokens,
+             padded_num_reqs_per_dp_rank, logits_indices_selector,
+             tokens_indices_selector, max_num_reqs_per_dp_rank) = result
+
+            # Structured output bypasses continue decode; tokens padded by token paddings (32)
+            assert padded_num_scheduled_tokens_per_dp_rank == 32
+            assert padded_num_reqs_per_dp_rank == 16
+            assert tokens_indices_selector is None
 
     @patch('jax.device_put', side_effect=lambda x, y: x)
     @patch('tpu_inference.runner.tpu_runner.NamedSharding')
@@ -1248,6 +1300,7 @@ class TestTPUJaxRunnerPadding:
 
     def setup_method(self):
         self.runner = MagicMock()
+        self.runner.input_batch.max_decode_tokens = 1
         self.runner.dp_size = 2
         self.runner.num_tokens_paddings = [16, 32, 64]
         self.runner.num_tokens_paddings_per_dp = [8, 16, 32]
@@ -1336,6 +1389,7 @@ class TestSamplingMetadataPassthrough:
         mock_set_mesh.return_value.__enter__ = MagicMock(return_value=None)
         mock_set_mesh.return_value.__exit__ = MagicMock(return_value=False)
         runner = MagicMock()
+        runner.input_batch.max_decode_tokens = 1
         mock_sampling_metadata = MagicMock()
         # Set the specific field we want to trace; other fields are auto-mocked.
         runner.execute_model_state.sampling_metadata = mock_sampling_metadata
@@ -1365,9 +1419,11 @@ class TestSamplingMetadataPassthrough:
         from tpu_inference.layers.common.sharding import ShardingAxisName
 
         runner = MagicMock()
+        runner.input_batch.max_decode_tokens = 1
         runner.dp_size = 2
         runner.vllm_config.sharding_config.prefill_cp_size = 1
         runner.max_num_reqs = 8
+        runner.attn_max_num_seqs = 8
         runner.max_num_blocks_per_req = 8
         runner.speculative_config = None
         runner.input_batch.num_reqs = 2
@@ -1439,6 +1495,7 @@ class TestSamplingMetadataPassthrough:
             mock_sampling_metadata):
         """_sample_from_logits() should use its tpu_sampling_metadata argument, not create one internally."""
         runner = MagicMock()
+        runner.input_batch.max_decode_tokens = 1
         runner.input_batch.num_reqs = 0  # empty batch keeps the loop trivial
         runner.speculative_config = None
         runner.scheduler_config.async_scheduling = False

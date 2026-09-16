@@ -55,6 +55,7 @@ class TestDPScheduler:
         config.cache_config = MagicMock()
         config.cache_config.enable_prefix_caching = False
         config.cache_config.prefix_caching_hash_algo = "sha256"
+        config.cache_config.mamba_num_blocks = None
         return config
 
     @pytest.fixture
@@ -129,6 +130,41 @@ class TestDPScheduler:
                 # Verify processes were started
                 mock_process = mock_ctx.Process.return_value
                 assert mock_process.start.call_count == 2
+
+    def test_init_with_mamba_num_blocks_per_rank(
+        self,
+        mock_vllm_config,
+        mock_kv_cache_config,
+        mock_structured_output_manager,
+    ):
+        """Test that mamba_num_blocks is partitioned per DP rank from cache_config."""
+        mock_vllm_config.cache_config.mamba_num_blocks = 60
+        scheduler = self._create_scheduler(
+            mock_vllm_config,
+            mock_kv_cache_config,
+            mock_structured_output_manager,
+        )
+        assert len(scheduler.per_rank_kv_cache_configs) == 2
+        for rank_config in scheduler.per_rank_kv_cache_configs:
+            assert rank_config.num_blocks == 50
+            assert rank_config.mamba_num_blocks == 30
+
+    def test_init_without_mamba_num_blocks(
+        self,
+        mock_vllm_config,
+        mock_kv_cache_config,
+        mock_structured_output_manager,
+    ):
+        """Test that rank configs have no mamba_num_blocks if not configured."""
+        scheduler = self._create_scheduler(
+            mock_vllm_config,
+            mock_kv_cache_config,
+            mock_structured_output_manager,
+        )
+        assert len(scheduler.per_rank_kv_cache_configs) == 2
+        for rank_config in scheduler.per_rank_kv_cache_configs:
+            assert rank_config.num_blocks == 50
+            assert getattr(rank_config, "mamba_num_blocks", None) is None
 
     def test_init_with_prefix_caching_enabled(
         self,
@@ -908,12 +944,20 @@ class TestDPScheduler:
 
         scheduler.assigned_dp_rank = {"req1": 0, "req2": 1}
 
+        # Test structured output flag propagation
+        output_0.has_structured_output_requests = True
+        output_0.pending_structured_output_tokens = False
+        output_1.has_structured_output_requests = False
+        output_1.pending_structured_output_tokens = True
+
         combined = scheduler._combine_scheduler_outputs([output_0, output_1])
 
         assert combined.total_num_scheduled_tokens == 30
 
-        # Verify new per-rank fields
+        # Verify new per-rank fields and structured output propagation
         assert combined.req_ids_per_rank == {0: ["req1"], 1: ["req2"]}
+        assert combined.has_structured_output_requests is True
+        assert combined.pending_structured_output_tokens is True
 
     def test_split_model_output_by_rank(self, mock_vllm_config,
                                         mock_kv_cache_config,
