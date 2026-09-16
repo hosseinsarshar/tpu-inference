@@ -318,6 +318,18 @@ class TpuPlatform(Platform):
                     os.environ["TPU_MULTIPROCESS_DP"])
 
     @classmethod
+    def pre_register_and_update(cls, parser=None) -> None:
+        """Adjust CLI defaults before `vllm serve` parses its arguments.
+
+        This is the only hook that runs early enough to change how many API
+        server processes are started: `ServeSubcommand.cmd` reads
+        `args.api_server_count` before any `VllmConfig` exists, so
+        `check_and_update_config` is already too late.
+        """
+        from tpu_inference.core import mesh_dp
+        mesh_dp.default_to_one_api_server(parser)
+
+    @classmethod
     def _setup_mesh_dp(cls, vllm_config: VllmConfig) -> None:
         """Make vLLM launch its DP ranks as threads instead of processes.
 

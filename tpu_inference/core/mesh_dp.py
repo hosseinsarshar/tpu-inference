@@ -42,9 +42,8 @@ What this module actually is
 Mesh DP is the multi-process path with *threads* instead of processes, so it
 is built as a **launcher**, not as a parallel class hierarchy. The engines it
 starts are stock ``vllm.v1.engine.core.EngineCoreProc`` objects running the
-stock busy loop; request routing, load balancing, wave/idle coordination and
-the whole ZMQ control plane are vLLM's own, unmodified. Two things are
-mesh-specific and nothing else is:
+stock busy loop; wave/idle coordination and the whole ZMQ control plane are
+vLLM's own, unmodified. Four things are mesh-specific and nothing else is:
 
 1. ``CoreEngineThreadManager`` spawns **one** engine-core child process and
    starts all ``local_engine_count`` ranks inside it as threads, where
@@ -56,6 +55,15 @@ mesh-specific and nothing else is:
    ``sharding_config.device_indexes``. That is an existing, first-class field
    ``TPUWorker.init_device`` already honours (``tpu_worker.py:379``), and it
    is what pins the rank's mesh to its own chips.
+3. ``SlotAwareDPLBClient`` replaces one method of vLLM's DP load balancer so
+   that routing is driven by the client's exact in-flight counts rather than
+   by a 100 ms-old coordinator snapshot.
+4. ``default_to_one_api_server`` stops ``vllm serve`` from starting one API
+   server per DP rank, because 3 only works when one process owns the whole
+   routing decision.
+
+The last two are the tail fix and are documented where they are defined; the
+numbers are below.
 
 The child process is not an implementation detail. Threads are what make the
 ranks share one JAX client and one weights cache, but they also make every
@@ -67,7 +75,8 @@ split the process path has: frontend in the parent, engines in a child.
 It also keeps ``jax.devices()`` out of the parent, which must stay free of an
 initialised TPU backend.
 
-``install()`` therefore rebinds exactly one name. An earlier version of this
+``install()`` therefore rebinds two names, both subclasses that override a
+single method each. An earlier version of this
 module substituted the engine core itself -- ``MeshDPEngineCore``,
 ``MeshDPEngineCoreProc``, a ``_SchedulerProxy`` and a hand-written rank router,
 about 900 lines that re-implemented request routing, output merging and the
@@ -75,40 +84,43 @@ engine-core control plane. All of it duplicated behaviour vLLM already has for
 multi-process DP, and every vLLM bump risked the two drifting apart. Deleting
 it is the point of this file.
 
-What this costs, measured
--------------------------
+Where this lands, measured
+--------------------------
 
 The old engine core hid all ``dp_size`` ranks behind one ``EngineCore``, so
 vLLM saw a single engine with a single queue of ``dp_size * max_num_seqs``
 slots and no DP coordinator ran at all. This module gives vLLM the eight real
 engines it thinks it has, each with its own scheduler and its own
 ``max_num_seqs`` slots -- the same shape multi-process DP has. Eight queues of
-32 are not one queue of 256, and the difference shows up in the tail, not the
-mean. On v6e-8, dp8/tp1, 1024x1024, sync scheduling:
+32 are not one queue of 256, so which queue a request lands in now matters,
+and that is what items 3 and 4 above are for. With them in place, on v6e-8,
+dp8/tp1, 1024x1024, sync scheduling:
 
-==========  ==========================  ==========================
-metric      256 global slots            1024 global slots
-==========  ==========================  ==========================
-throughput  14,019 vs 14,160  (-1.0%)   24,755 vs 26,398  (-6.2%)
-P99 TTFT    14,647 vs 2,571  (+470%)    5,823 vs 5,686   (+2.4%)
-median e2e  15,588 vs 17,781 (-12.3%)   36,090 vs 36,365  (-0.8%)
-==========  ==========================  ==========================
+==========  ================  ================  ================
+metric      256 slots         512 slots         1024 slots
+==========  ================  ================  ================
+throughput  15,121 vs 14,160  22,823 vs 22,419  29,779 vs 26,869
+P99 TTFT     2,510 vs  2,571   3,935 vs  3,828   6,030 vs  5,699
+median e2e  16,477 vs 17,781  22,167 vs 22,308  32,168 vs 35,949
+==========  ================  ================  ================
 
-(new vs old, means of 3-6 runs each; the throughput deltas are inside the
-run-to-run spread, which at 1024 slots ran 23.7k-29.6k on the old code.)
+(new vs old, means of 3-7 runs per cell, all dp8/tp1 with no other flags set.
+Throughput is +6.8% / +1.8% / +10.8% and P99 TTFT -2.4% / +2.8% / +5.8%
+across the three sizes. Run-to-run spread is wide -- throughput at 1024 slots
+ran 23.7k-29.7k on the old code alone -- so read throughput as "no worse"
+rather than as a speedup, and read the tail as parity.)
 
-At 1024 slots nothing moves: each rank holds 128 slots, no rank ever fills,
-and the queue split is invisible. At 256 slots each rank holds exactly 32 and
-the benchmark keeps exactly 256 in flight, so every rank sits at capacity and
-an unlucky request waits out a whole generation instead of taking the next
-slot to free anywhere. The old code bought its 2.6s tail with the single
-queue, not with clever routing. Capping the stock load balancer at
-``max_num_seqs`` was tried and changed nothing (P99 15.3s over three runs),
-which is the evidence that the queue split -- not the routing policy -- is
-what moved.
-
-That is the trade this module makes on purpose: vLLM's DP path, with vLLM's
-tail, in exchange for ~900 lines that had to be kept in step with it by hand.
+Without items 3 and 4 the tail at 256 slots was 14,647 ms -- 5.7x the old
+code -- while throughput and median were unchanged. That case is the hard one:
+each rank holds exactly 32 slots, the benchmark keeps exactly 256 requests in
+flight, so the system has zero slack and a single misrouted request waits out
+a whole generation. Two things caused the misroutes. ``vllm serve`` defaults
+``api_server_count`` to ``data_parallel_size``, so eight independent routers
+each saw a different slice of the load, and the only shared signal between
+them was a coordinator snapshot up to 100 ms stale. Fixing either one alone
+did not help (P99 stayed at 15-17 s); fixing both together did. At 1024 slots
+no rank ever fills, so routing barely matters and the numbers move little
+either way.
 
 Independence and dispatch, concretely:
 
@@ -131,11 +143,13 @@ import sys
 import threading
 import time
 import weakref
+from collections import Counter
 from typing import Any, Dict, List, Optional
 
 import jax
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.utils.system_utils import get_mp_context
+from vllm.v1.engine.core_client import DPLBAsyncMPClient
 from vllm.v1.engine.utils import CoreEngineProcManager, SignalCallback
 from vllm.v1.utils import shutdown as shutdown_processes
 
@@ -465,8 +479,196 @@ class CoreEngineThreadManager(CoreEngineProcManager):
                 self.shutdown()
 
 
+class SlotAwareDPLBClient(DPLBAsyncMPClient):
+    """vLLM's DP load balancer, routing on what it knows instead of what it saw.
+
+    Stock ``get_core_engine_for_request`` scores an engine as
+    ``max(client_count * engine_inflight, waiting + running)``, plus a KV
+    pressure penalty when ``waiting`` is non-zero. ``engine_inflight`` is exact:
+    it goes up when this client sends a request and down the moment the engine
+    reports it finished. ``waiting``/``running`` come from a ``DPCoordinator``
+    snapshot that is refreshed at most every 100 ms
+    (``coordinator.py:261``), and nothing corrects it downward in between.
+
+    The staleness is harmless while engines have spare slots and fatal when they
+    do not. A closed-loop client submits the replacement request microseconds
+    after the completion, so the snapshot is *always* stale for the one engine
+    that just freed a slot: it still reads as full, the ``max()`` lets that
+    larger stale value win over the exact count, some genuinely full engine
+    ties with it, and the request is committed to a queue it will sit in for a
+    whole generation. There is no work stealing between engines, so that
+    commitment is final. Measured at dp8/tp1, ``max_num_seqs=32``, 256
+    concurrent -- every rank exactly full -- the engines run like this:
+
+        running = 32 31 32 32 32 32 32 25   waiting = 8   free slots = 8
+
+    Eight requests queued, eight slots idle, and it persists because the client
+    cannot start anything new until one of the queued requests finishes.
+
+    Patching the snapshot on completion does not fix it: ``lb_engines`` is
+    rebound wholesale by the next broadcast, so the correction is erased within
+    100 ms and the tail does not move (measured: P99 14.9 s, unchanged). The
+    stale term has to stop describing load this client already knows about.
+
+    So this subclass splits the estimate by who owns the information::
+
+        score = engine_inflight[e] + max(0, (waiting + running)[e] - mine[e])
+
+    where ``mine[e]`` is this client's ``engine_inflight[e]`` sampled by the
+    ``lb_engines`` setter below, at the instant the snapshot arrived. The
+    subtraction removes this client's own
+    contribution from the snapshot, leaving only what the *other* front ends
+    have on that engine; adding back the live count makes our own half exact
+    and instantaneous. Nothing is stale except other clients' churn during one
+    100 ms window, which at these rates is about one request.
+
+    Simulated at dp8, 32 slots/rank, 256 concurrent, 20k completions, counting
+    decisions that queued a request while a slot was free elsewhere:
+
+    ==============  ===========  ===========
+    policy          1 front end  8 front ends
+    ==============  ===========  ===========
+    stock           6877         5612
+    inflight only   0            7222
+    this one        0            4
+    ==============  ===========  ===========
+
+    Scoring on ``engine_inflight`` alone is exact for one front end and useless
+    for eight: each client balances its own share perfectly, but the shares are
+    uneven and their remainders stack on the same engines. The snapshot is the
+    only thing that can see across clients, which is why it is kept -- just not
+    inside a ``max()`` that lets it overrule what we know for certain.
+
+    Two upstream details are dropped. The local ``current_counts[i][0] +=
+    client_count`` bump is gone because ``engine_inflight`` already records our
+    own sends, exactly and immediately -- and leaving it in would inflate the
+    snapshot we now subtract from. The KV-pressure penalty on ``waiting`` is
+    gone because it only discriminates when prefix caching makes queues drain
+    at different rates per engine; here it can only re-admit stale-snapshot
+    noise into the decision.
+
+    Not mesh-specific -- vLLM's multi-process DP path has the same tail for the
+    same reason -- but it is installed here because this is the path that has to
+    be well behaved at exactly 100% slot occupancy.
+    """
+
+    _inflight_at_snapshot: Counter = Counter()
+
+    @property
+    def lb_engines(self) -> Any:
+        return self._lb_engines
+
+    @lb_engines.setter
+    def lb_engines(self, counts: Any) -> None:
+        """Sample our own in-flight counts the instant a snapshot lands.
+
+        The sample has to be taken here rather than lazily at the next routing
+        decision. Our own completions between the two would be missing from
+        ``mine`` while still being counted in the snapshot, so ``others`` would
+        absorb them, the two ``inflight`` terms in the score would cancel, and
+        the policy would silently decay back into scoring on the stale
+        snapshot alone.
+
+        ``DPLBAsyncMPClient.__init__`` assigns ``lb_engines`` before
+        ``engine_inflight`` exists, hence the guard.
+        """
+        self._lb_engines = counts
+        inflight = getattr(self, "engine_inflight", None)
+        if inflight is not None:
+            self._inflight_at_snapshot = inflight.copy()
+
+    def get_core_engine_for_request(self, request: Any) -> Any:
+        from vllm.v1.pool.late_interaction import (
+            get_late_interaction_engine_index)
+
+        # Both short circuits pin the request to a rank for correctness, not
+        # for balance, so they bypass scoring entirely -- same as upstream.
+        if (eng_index := request.data_parallel_rank) is None and (
+                eng_index := get_late_interaction_engine_index(
+                    request.pooling_params, len(self.core_engines))) is None:
+            counts = self.lb_engines
+            engines = self.core_engines
+            inflight = self.engine_inflight
+            num_engines = len(counts)
+            mine = self._inflight_at_snapshot
+
+            min_score = sys.maxsize
+            eng_index = 0
+            for i in range(num_engines):
+                # Scan from a rotating origin so that ties -- which is every
+                # decision while the engines are empty -- go round-robin
+                # instead of always landing on rank 0.
+                idx = (self.eng_start_index + i) % num_engines
+                engine = engines[idx]
+                waiting, running, _kv_usage = counts[idx]
+                others = (waiting + running) - mine[engine]
+                score = inflight[engine] + (others if others > 0 else 0)
+                if score < min_score:
+                    min_score = score
+                    eng_index = idx
+            self.eng_start_index = (self.eng_start_index + 1) % num_engines
+
+        chosen_engine = self.core_engines[eng_index]
+        # Recorded so that an abort can be forwarded to the right engine, and
+        # so the completion decrements the counter we just incremented.
+        self.reqs_in_flight[request.request_id] = chosen_engine
+        self.engine_inflight[chosen_engine] += 1
+        return chosen_engine
+
+
+def default_to_one_api_server(parser: Any) -> None:
+    """Stop ``vllm serve`` from defaulting to one API server per DP rank.
+
+    ``ServeSubcommand.cmd`` sets ``api_server_count = data_parallel_size``
+    whenever the flag was not given (``cli/serve.py:119``), so dp8 gets eight
+    front ends behind ``SO_REUSEPORT``. Each front end runs its own
+    ``DPLBAsyncMPClient`` with its own ``engine_inflight``, and they never
+    compare notes except through the 100 ms coordinator snapshot.
+
+    That is what breaks routing. ``SO_REUSEPORT`` splits connections badly --
+    measured at 256 concurrent, one front end held 98 of them and another held
+    5 -- so no front end can infer the global picture from its own share, and
+    the only cross-client signal is a snapshot that is always stale for the
+    engine that just freed a slot. Free slots and queued requests then coexist
+    for a whole generation:
+
+        waiting = 0 1 0 0 4 0 3 0   running = 31 32 31 29 32 30 32 30
+
+    unchanged across 14 seconds of a run where a generation takes 15.
+
+    With a single front end the router's ``engine_inflight`` is not a sample of
+    the load, it *is* the load, so the replacement for a completed request goes
+    back to the engine that just freed the slot, every time. Measured on v6e-8,
+    dp8/tp1, 1024x1024, ``max_num_seqs=32``, 256 concurrent:
+
+    ================  ===========  ============  ===========
+    front ends        router       throughput    P99 TTFT
+    ================  ===========  ============  ===========
+    8 (vLLM default)  stock        14,019        14,647 ms
+    8                 in-flight    13,915        16,538 ms
+    1                 stock        13,423        15,025 ms
+    1                 in-flight    17,363         2,334 ms
+    ================  ===========  ============  ===========
+
+    Both changes are needed and neither works alone. The last row also beats
+    the pre-refactor engine core, which managed 14,160 and 2,571 ms.
+
+    This sets the *default*, so ``--api-server-count`` still wins if given.
+    Raise it if one front end cannot keep up with tokenization and HTTP, and
+    accept the tail that comes back with it.
+
+    Called from ``TpuPlatform.pre_register_and_update``, which vLLM invokes at
+    the end of ``AsyncEngineArgs.add_cli_args`` -- after ``make_arg_parser``
+    has registered ``--api-server-count``, so ``set_defaults`` finds the action
+    and replaces its default rather than being overwritten by it.
+    """
+    if parser is None or not envs.TPU_MESH_BASED_DP:
+        return
+    parser.set_defaults(api_server_count=1)
+
+
 def install() -> None:
-    """Point vLLM's local-engine launcher at the thread manager.
+    """Point vLLM's local-engine launcher and DP router at our subclasses.
 
     ``launch_core_engines`` resolves ``CoreEngineProcManager`` from
     ``vllm.v1.engine.utils``'s module globals at call time, and the two
@@ -475,17 +677,27 @@ def install() -> None:
     name both constructs the thread manager and keeps it recognised as the
     local-engine manager.
 
-    ``vllm.v1.engine.core_client`` also imports the name, but only as a type
-    annotation, so it does not need patching.
+    ``make_async_mp_client`` resolves ``DPLBAsyncMPClient`` from
+    ``vllm.v1.engine.core_client``'s globals the same way
+    (``core_client.py:138``), so the router is rebound identically. This runs in
+    every API server process, not just the one that launches the engines, so
+    each front end gets the slot-aware router.
+
+    ``vllm.v1.engine.core_client`` also imports ``CoreEngineProcManager``, but
+    only as a type annotation, so it does not need patching.
     """
     global _INSTALLED
     if _INSTALLED:
         return
 
+    from vllm.v1.engine import core_client
     from vllm.v1.engine import utils as engine_utils
 
     engine_utils.CoreEngineProcManager = CoreEngineThreadManager
+    core_client.DPLBAsyncMPClient = SlotAwareDPLBClient
 
     _INSTALLED = True
     logger.info("Mesh-based DP installed: DP ranks run as threads "
-                "(CoreEngineProcManager -> CoreEngineThreadManager)")
+                "(CoreEngineProcManager -> CoreEngineThreadManager), "
+                "DP router scores on exact in-flight counts "
+                "(DPLBAsyncMPClient -> SlotAwareDPLBClient)")
