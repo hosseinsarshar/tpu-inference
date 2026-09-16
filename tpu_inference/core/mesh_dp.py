@@ -75,6 +75,41 @@ engine-core control plane. All of it duplicated behaviour vLLM already has for
 multi-process DP, and every vLLM bump risked the two drifting apart. Deleting
 it is the point of this file.
 
+What this costs, measured
+-------------------------
+
+The old engine core hid all ``dp_size`` ranks behind one ``EngineCore``, so
+vLLM saw a single engine with a single queue of ``dp_size * max_num_seqs``
+slots and no DP coordinator ran at all. This module gives vLLM the eight real
+engines it thinks it has, each with its own scheduler and its own
+``max_num_seqs`` slots -- the same shape multi-process DP has. Eight queues of
+32 are not one queue of 256, and the difference shows up in the tail, not the
+mean. On v6e-8, dp8/tp1, 1024x1024, sync scheduling:
+
+==========  ==========================  ==========================
+metric      256 global slots            1024 global slots
+==========  ==========================  ==========================
+throughput  14,019 vs 14,160  (-1.0%)   24,755 vs 26,398  (-6.2%)
+P99 TTFT    14,647 vs 2,571  (+470%)    5,823 vs 5,686   (+2.4%)
+median e2e  15,588 vs 17,781 (-12.3%)   36,090 vs 36,365  (-0.8%)
+==========  ==========================  ==========================
+
+(new vs old, means of 3-6 runs each; the throughput deltas are inside the
+run-to-run spread, which at 1024 slots ran 23.7k-29.6k on the old code.)
+
+At 1024 slots nothing moves: each rank holds 128 slots, no rank ever fills,
+and the queue split is invisible. At 256 slots each rank holds exactly 32 and
+the benchmark keeps exactly 256 in flight, so every rank sits at capacity and
+an unlucky request waits out a whole generation instead of taking the next
+slot to free anywhere. The old code bought its 2.6s tail with the single
+queue, not with clever routing. Capping the stock load balancer at
+``max_num_seqs`` was tried and changed nothing (P99 15.3s over three runs),
+which is the evidence that the queue split -- not the routing policy -- is
+what moved.
+
+That is the trade this module makes on purpose: vLLM's DP path, with vLLM's
+tail, in exchange for ~900 lines that had to be kept in step with it by hand.
+
 Independence and dispatch, concretely:
 
 * Ranks share no JAX arrays, no collectives and no barrier. A rank's mesh spans
