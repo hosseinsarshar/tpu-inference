@@ -17,6 +17,7 @@ import functools
 import logging
 import os
 import random
+import resource
 import sys
 import time
 from contextlib import contextmanager, nullcontext
@@ -929,8 +930,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # exactly one thread (one per rank under mesh DP), so a plain list is
         # enough.
         self._phase_stack: list[list[float]] = []
+        # Voluntary context switches per phase. See `_nvcsw`.
+        self._phase_sw: dict[str, int] = {}
         self._split_t0 = 0.0
         self._split_c0 = 0.0
+        self._split_v0 = 0
         self._phase_steps = 0
         # See `_init_dispatch_probe`; inert unless TPU_MESH_DP_PROBE_DISPATCH.
         self._probe_n = 0
@@ -959,9 +963,52 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         return (shape.get(ShardingAxisName.BATCH, 1) == 1
                 and shape.get(ShardingAxisName.ATTN_DATA, 1) == 1)
 
+    def _dispatch_lock_at(self, level: int):
+        """Serialises one enqueue against this process's other ranks.
+
+        A no-op outside mesh DP: every other mode has one runner per process,
+        so the lock would always be uncontended and would only cost an acquire.
+        See `runner_utils.dispatch_lock` for why serialising wins.
+
+        `level` is the setting of `MESH_DP_DISPATCH_LOCK` at which this site
+        starts locking: 1 for the model dispatch, which is worth 32.6 of a
+        step's 60.5 handoffs on its own, and 2 for the smaller enqueues, which
+        are worth ~2.4 each. Only 1 is on by default -- the smaller enqueues
+        measured worse locked than unlocked, because six contended acquires a
+        step convoy the ranks for less than they save. See `envs.py`.
+        """
+        if (envs.TPU_MESH_BASED_DP
+                and envs.MESH_DP_DISPATCH_LOCK >= level):
+            return runner_utils.dispatch_lock()
+        return nullcontext()
+
+    @functools.cached_property
+    def _dispatch_lock(self):
+        """The model dispatch's lock. See `_dispatch_lock_at`."""
+        return self._dispatch_lock_at(1)
+
+    @functools.cached_property
+    def _enqueue_lock(self):
+        """The smaller enqueues' lock. See `_dispatch_lock_at`."""
+        return self._dispatch_lock_at(2)
+
+    @staticmethod
+    def _nvcsw() -> int:
+        """This thread's voluntary context switches so far.
+
+        Under mesh DP a rank thread's voluntary switches are almost entirely
+        GIL handoffs: it drops the GIL around a C call, sleeps on the condvar
+        and is woken by whoever hands it back. The round trip is ~190us, so a
+        phase's switch count is a better predictor of what it costs the step
+        than either its wall or its CPU time. `getrusage` costs 0.6us and does
+        not itself release the GIL, so counting does not change what is
+        counted.
+        """
+        return resource.getrusage(resource.RUSAGE_THREAD).ru_nvcsw
+
     @contextmanager
     def _phase(self, name: str):
-        """Accumulate wall and this thread's CPU time for one host phase.
+        """Accumulate wall, this thread's CPU time, and GIL handoffs for a phase.
 
         Wall alone cannot rank fixes under mesh DP. Eight rank threads share one
         GIL, so a phase that does 100us of Python shows up as ~800us of wall
@@ -979,23 +1026,28 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             yield
             return
         stack = self._phase_stack
-        stack.append([0.0, 0.0])
+        stack.append([0.0, 0.0, 0])
         t0 = time.perf_counter()
         c0 = time.thread_time()
+        v0 = self._nvcsw()
         try:
             yield
         finally:
             dt = (time.perf_counter() - t0) * 1e6
             dc = (time.thread_time() - c0) * 1e6
-            child_dt, child_dc = stack.pop()
+            dv = self._nvcsw() - v0
+            child_dt, child_dc, child_dv = stack.pop()
             if stack:
                 stack[-1][0] += dt
                 stack[-1][1] += dc
+                stack[-1][2] += dv
             if not name.startswith("TOTAL_"):
                 dt -= child_dt
                 dc -= child_dc
+                dv -= child_dv
             self._phase_us[name] = self._phase_us.get(name, 0.0) + dt
             self._phase_cpu_us[name] = self._phase_cpu_us.get(name, 0.0) + dc
+            self._phase_sw[name] = self._phase_sw.get(name, 0) + dv
             if dt > self._phase_max_us.get(name, 0.0):
                 self._phase_max_us[name] = dt
 
@@ -1034,6 +1086,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if self._phase_stats:
             self._split_t0 = time.perf_counter()
             self._split_c0 = time.thread_time()
+            self._split_v0 = self._nvcsw()
 
     def _split(self, name: str) -> None:
         """Charge the time since the previous split (or `_split_begin`) to `name`.
@@ -1046,15 +1099,18 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         """
         if not self._phase_stats:
             return
-        now, cpu = time.perf_counter(), time.thread_time()
+        now, cpu, sw = time.perf_counter(), time.thread_time(), self._nvcsw()
         dt = (now - self._split_t0) * 1e6
         dc = (cpu - self._split_c0) * 1e6
-        self._split_t0, self._split_c0 = now, cpu
+        dv = sw - self._split_v0
+        self._split_t0, self._split_c0, self._split_v0 = now, cpu, sw
         if self._phase_stack:
             self._phase_stack[-1][0] += dt
             self._phase_stack[-1][1] += dc
+            self._phase_stack[-1][2] += dv
         self._phase_us[name] = self._phase_us.get(name, 0.0) + dt
         self._phase_cpu_us[name] = self._phase_cpu_us.get(name, 0.0) + dc
+        self._phase_sw[name] = self._phase_sw.get(name, 0) + dv
         # A mean says nothing about shape. `p_asyncif` averages 805us of CPU
         # over a stretch that is one `if`, and that `if` measures 49ns in
         # isolation -- a 16000x gap. Either it really costs that on every step
@@ -1087,19 +1143,25 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         total = sum(totals.values()) or sum(leaves.values())
         # `cpu` is this thread's own CPU time, so it is the part of the wall a
         # fix could actually delete; the gap is GIL queueing or device wait.
+        # `sw` is voluntary context switches per step, i.e. GIL handoffs. At
+        # ~190us of sleep/wake round trip each they are what a fix should be
+        # ranked on; a phase can be cheap in CPU and still dominate the step.
         parts = " ".join(
             f"{k}={v/n:.0f}/{self._phase_cpu_us.get(k, 0.0)/n:.0f}us"
-            f"({100*v/total:.0f}%,max{self._phase_max_us.get(k, 0.0)/1000:.0f}ms)"
+            f"({100*v/total:.0f}%,max{self._phase_max_us.get(k, 0.0)/1000:.0f}ms"
+            f",sw{self._phase_sw.get(k, 0)/n:.1f})"
             for k, v in sorted(leaves.items(), key=lambda kv: -kv[1]))
         other = total - sum(leaves.values())
         cpu_leaves = sum(self._phase_cpu_us.get(k, 0.0) for k in leaves)
         cpu_total = sum(self._phase_cpu_us.get(k, 0.0) for k in totals) or \
             cpu_leaves
+        sw_total = sum(self._phase_sw.get(k, 0) for k in totals) or \
+            sum(self._phase_sw.get(k, 0) for k in leaves)
         logger.info(
             "host phases over %d steps (wall/cpu) | step=%.0fus cpu=%.0fus"
-            " (%.0f%% of wall) | %s other=%.0f/%.0fus(%.0f%%)", n, total / n,
-            cpu_total / n, 100 * cpu_total / total, parts, other / n,
-            (cpu_total - cpu_leaves) / n, 100 * other / total)
+            " (%.0f%% of wall) sw=%.1f/step | %s other=%.0f/%.0fus(%.0f%%)", n,
+            total / n, cpu_total / n, 100 * cpu_total / total, sw_total / n,
+            parts, other / n, (cpu_total - cpu_leaves) / n, 100 * other / total)
 
     def _init_random(self):
         if self.model_config.seed is None:
@@ -1969,7 +2031,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     with self._phase("probe"):
                         for _ in range(self._probe_n):
                             self._probe_out = self._probe_fn(self._probe_args)
-                with self._phase("model_fn"):
+                # The lock is inside the phase so that time spent waiting for
+                # it is charged to `model_fn` rather than disappearing.
+                with self._phase("model_fn"), self._dispatch_lock:
                     (self.kv_caches, hidden_states, aux_hidden_states,
                      expert_indices) = self.model_fn(
                          self.state_leaves,
@@ -2039,11 +2103,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 self.vllm_config.sharding_config.prefill_cp_size)
         else:
             full_logits = None
-            with self._phase("select"):
+            with self._phase("select"), self._enqueue_lock:
                 hidden_states = self._select_from_array_fn(
                     hidden_states, logits_indices, self.mesh,
                     self.vllm_config.sharding_config.prefill_cp_size)
-            with self._phase("compute_logits"):
+            with self._phase("compute_logits"), self._enqueue_lock:
                 logits = self.compute_logits_fn(
                     self.state_leaves,
                     hidden_states,
@@ -2566,7 +2630,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # unchanged. Casting outside costs an eager dispatch (3% of all
             # GIL-held time under mesh DP) and materialises a full
             # [batch, vocab] f32 tensor that XLA otherwise fuses away.
-            with self.maybe_forbid_compile, self._phase("sample"):
+            with self.maybe_forbid_compile, self._phase("sample"), \
+                    self._enqueue_lock:
                 next_tokens, processed_logits = sample(
                     step_rng,
                     self.mesh,
@@ -3704,7 +3769,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 mamba_state_indices_cpu[req_offset:req_offset +
                                         _num_reqs] = (global_slots %
                                                       local_slots)
-            with self._phase("h2d"):
+            with self._phase("h2d"), self._enqueue_lock:
                 (request_distribution, mamba_state_indices,
                  dev_arrays_payload) = device_array(
                      self.mesh,
@@ -3713,7 +3778,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                      sharding=metadata_attn_sharding)
         elif fuse_h2d:
             mamba_state_indices = None
-            with self._phase("h2d"):
+            with self._phase("h2d"), self._enqueue_lock:
                 dev_arrays_payload = device_array(
                     self.mesh, metadata_blob, sharding=metadata_attn_sharding)
         else:
@@ -3723,7 +3788,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     self.mesh, (request_distribution, metadata_blob),
                     sharding=metadata_attn_sharding)
 
-        with self._phase("unpack"):
+        with self._phase("unpack"), self._enqueue_lock:
             metadata = common_utils.DeviceBuffer.unpack_arrays(
                 dev_arrays_payload, metadata_layout, unpack_shardings)
         if fuse_h2d:

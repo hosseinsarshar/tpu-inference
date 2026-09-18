@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     CONTINUE_DECODE_EOS_CHECK_INTERVAL: int = 1
     CONTINUE_DECODE_AFTER_PREFILL: bool = False
     CONTINUE_DECODE_GATE_STATS: bool = False
+    MESH_DP_DISPATCH_LOCK: int = 1
     HOST_PHASE_STATS: bool = False
     FUSE_H2D_METADATA: bool = True
     USE_BATCHED_RPA_KERNEL: bool = False
@@ -377,6 +378,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Log how often the continue_decode gate fires vs. is blocked by a prefill.
     "CONTINUE_DECODE_GATE_STATS":
     env_bool("CONTINUE_DECODE_GATE_STATS"),
+    # Serialise device enqueues across a process's rank threads. Only has an
+    # effect under mesh DP, which is the only mode with more than one runner in
+    # a process. Donating the KV cache releases the GIL once per layer, and
+    # under 8-way contention each release costs a ~190us handoff round trip;
+    # the ranks do not overlap in the dispatch anyway. See `runner/utils.py`.
+    #   0 = off, 1 = the model dispatch only, 2 = every enqueue in the step.
+    # Never covers a call that waits on a result (`d2h`), only enqueues.
+    # 1 is the default because 2 measured WORSE than off: v6e-8 dp8/tp1
+    # 1024x1024, n=3 each, 14,267 tok/s at 0 and 15,236 at 1 but 12,504 at 2,
+    # with P99 TTFT 10.3-11.4s against 2.5s. Six acquires per step instead of
+    # one convoys the ranks, and each contended acquire is itself a handoff, so
+    # the small enqueues lose more to the lock than their ~2.4 switches cost.
+    "MESH_DP_DISPATCH_LOCK":
+    lambda: int(os.getenv("MESH_DP_DISPATCH_LOCK") or "1"),
     # Break a host step down into its phases (input prep, H2D, each jit
     # dispatch, D2H) and log the per-step budget. Mesh DP is GIL-bound, so the
     # question is always which Python is holding the GIL, and a GIL profile
