@@ -651,6 +651,9 @@ class TPUWorker(WorkerBase):
     def profile(self,
                 is_start: bool = True,
                 profile_prefix: str | None = None):
+        if not self.profile_dir or (self.devices
+                                    and self.devices[0].id != 0):
+            return
         if is_start:
             standard_opts, advanced_opts = _parse_profile_options(
                 profile_prefix)

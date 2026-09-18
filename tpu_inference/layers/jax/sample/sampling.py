@@ -228,9 +228,11 @@ def _distributed_topk_sample(
             jnp.ones_like(local_temperature),
             local_temperature,
         )
-        scaled_logits = local_logits / safe_temperature[:, None]
+        scaled_logits = local_logits / safe_temperature.astype(
+            local_logits.dtype)[:, None]
         local_values, local_ids = lax.top_k(scaled_logits,
                                             candidates_per_shard)
+        local_values = local_values.astype(jnp.float32)
         local_ids = (local_ids + shard_index * local_vocab_size).astype(
             jnp.int32)
 
@@ -278,25 +280,29 @@ def sample(
     # (B, vocab_size)
     if tpu_sampling_metadata._cache_collision_dummy is not None:
         # Force a dependency on the dummy tensor's shape to ensure unique HLO.
-        logits = logits + 0 * jnp.sum(
-            tpu_sampling_metadata._cache_collision_dummy)
+        logits = logits + jnp.zeros(
+            (), dtype=logits.dtype) * jnp.sum(
+                tpu_sampling_metadata._cache_collision_dummy).astype(
+                    logits.dtype)
 
+    need_ret_logits = bool(tpu_sampling_metadata.logprobs)
     greedy_tokens = jnp.argmax(logits, axis=-1)
-    logits = logits.astype(jnp.float32)
     if not tpu_sampling_metadata.do_sampling:
         ret_tokens = greedy_tokens
-        ret_logits = logits
+        ret_logits = logits.astype(jnp.float32) if need_ret_logits else None
     else:
         is_greedy = tpu_sampling_metadata.temperature < _SAMPLING_EPS
 
         def sample_full_vocab(_):
             full_logits = jax.lax.with_sharding_constraint(
-                logits, NamedSharding(mesh, P(ShardingAxisName.ATTN_DATA,
-                                              None)))
+                logits.astype(jnp.float32),
+                NamedSharding(mesh, P(ShardingAxisName.ATTN_DATA, None)))
             processed_logits = _apply_sampling_transforms(
                 full_logits, tpu_sampling_metadata)
             sampled_tokens = jax.random.categorical(rng, processed_logits)
             tokens = jnp.where(is_greedy, greedy_tokens, sampled_tokens)
+            if not need_ret_logits:
+                return tokens, None
             output_logits = jnp.where(is_greedy[:, None], full_logits,
                                       processed_logits)
             return tokens, output_logits
@@ -323,10 +329,12 @@ def sample(
                 def use_candidate_result(_):
                     tokens = jnp.where(is_greedy, greedy_tokens,
                                        sampled_tokens)
+                    if not need_ret_logits:
+                        return tokens, None
                     # Processed-logit modes disable this path. Returning the
                     # raw input supports raw logprobs without materializing
                     # full-vocabulary filtered logits.
-                    return tokens, logits
+                    return tokens, logits.astype(jnp.float32)
 
                 return lax.cond(incomplete_candidates,
                                 sample_full_vocab,

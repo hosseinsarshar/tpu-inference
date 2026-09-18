@@ -591,8 +591,9 @@ class SlotAwareDPLBClient(DPLBAsyncMPClient):
             inflight = self.engine_inflight
             num_engines = len(counts)
             mine = self._inflight_at_snapshot
+            single_client = getattr(self, "client_count", 1) <= 1
 
-            min_score = sys.maxsize
+            min_key = (sys.maxsize, sys.maxsize, float("inf"))
             eng_index = 0
             for i in range(num_engines):
                 # Scan from a rotating origin so that ties -- which is every
@@ -600,11 +601,17 @@ class SlotAwareDPLBClient(DPLBAsyncMPClient):
                 # instead of always landing on rank 0.
                 idx = (self.eng_start_index + i) % num_engines
                 engine = engines[idx]
-                waiting, running, _kv_usage = counts[idx]
-                others = (waiting + running) - mine[engine]
-                score = inflight[engine] + (others if others > 0 else 0)
-                if score < min_score:
-                    min_score = score
+                waiting, running, kv_usage = counts[idx]
+                if single_client:
+                    others = 0
+                else:
+                    others = (waiting + running) - mine[engine]
+                    if others < 0:
+                        others = 0
+                score = inflight[engine] + others
+                key = (score, waiting, kv_usage)
+                if key < min_key:
+                    min_key = key
                     eng_index = idx
             self.eng_start_index = (self.eng_start_index + 1) % num_engines
 

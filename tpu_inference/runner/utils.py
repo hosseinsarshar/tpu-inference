@@ -678,7 +678,8 @@ class PhasedBasedProfiler:
         }
         if envs.PROFILE_SINGLE_DEVICE:
             self.default_profiling_options.advanced_configuration = {
-                "tpu_num_chips_to_profile_per_task": 1,
+                "tpu_num_chips_to_profile_per_task":
+                (len(jax.devices()) if envs.TPU_MESH_BASED_DP else 1),
                 "tpu_num_sparse_cores_to_trace": 1,
                 "tpu_num_sparse_core_tiles_to_trace": 1,
             }
