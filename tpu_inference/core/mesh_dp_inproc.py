@@ -502,6 +502,25 @@ class MeshDPEngineCore(vLLMEngineCore):
         self.log_stats = log_stats
         self.dp_size = vllm_config.sharding_config.mesh_dp_size
 
+        if (self.dp_size > 1
+                and os.environ.get("MESH_DP_SCALE_MAX_SEQS", "1") == "1"
+                and vllm_config.scheduler_config.max_num_seqs >= 64):
+            orig_max_seqs = vllm_config.scheduler_config.max_num_seqs
+            # Next power-of-two multiple >= 2x (orig_max_seqs / dp_size), min 16
+            raw_target = max(16, ((orig_max_seqs + self.dp_size - 1) // self.dp_size) * 2)
+            pow2_target = 16
+            while pow2_target < raw_target and pow2_target < orig_max_seqs:
+                pow2_target *= 2
+            vllm_config.scheduler_config.max_num_seqs = min(orig_max_seqs, pow2_target)
+            logger.info(
+                "Mesh-based DP | scaled per-rank max_num_seqs from %d to %d "
+                "across dp_size=%d (global capacity=%d)",
+                orig_max_seqs,
+                vllm_config.scheduler_config.max_num_seqs,
+                self.dp_size,
+                vllm_config.scheduler_config.max_num_seqs * self.dp_size,
+            )
+
         assign_device_groups(vllm_config)
 
         # Build the engines concurrently. Most of the ~2min per-engine cost is
