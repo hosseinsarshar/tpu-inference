@@ -170,16 +170,17 @@ _INSTALLED = False
 _SWITCH_INTERVAL_S = float(os.getenv("TPU_MESH_DP_SWITCH_INTERVAL", "0.05"))
 
 
-def is_mesh_dp_enabled(vllm_config: VllmConfig) -> bool:
-    """True when this config should run its DP ranks as threads.
+def _use_inproc_mesh_dp() -> bool:
+    return (os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") == "0"
+            or "proxy" in os.environ.get("JAX_PLATFORMS", ""))
 
-    Deliberately the same shape of test the multi-process path uses: the flag,
-    plus more than one DP rank to spread. Mesh DP no longer collapses
-    ``data_parallel_size``, so this stays true for the whole life of the
-    config instead of having to be recovered from an env var.
-    """
+
+def is_mesh_dp_enabled(vllm_config: VllmConfig) -> bool:
     if not envs.TPU_MESH_BASED_DP:
         return False
+    sharding_config = getattr(vllm_config, "sharding_config", None)
+    if getattr(sharding_config, "mesh_dp_size", 1) > 1:
+        return True
     return vllm_config.parallel_config.data_parallel_size > 1
 
 
@@ -695,6 +696,12 @@ def install() -> None:
     """
     global _INSTALLED
     if _INSTALLED:
+        return
+
+    if _use_inproc_mesh_dp():
+        from tpu_inference.core import mesh_dp_inproc
+        mesh_dp_inproc.install()
+        _INSTALLED = True
         return
 
     from vllm.v1.engine import core_client

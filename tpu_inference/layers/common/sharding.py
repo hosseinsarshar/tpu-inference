@@ -193,14 +193,25 @@ class ShardingConfigManager:
     def __init__(self,
                  sharding_strategy: ShardingStrategy,
                  device_indexes: Optional[List] = None,
-                 mm_encoder_tp_mode: str = "weights"):
+                 mm_encoder_tp_mode: str = "weights",
+                 mesh_dp_size: int = 1):
 
         self.sharding_strategy: ShardingStrategy = sharding_strategy
         self.device_indexes: Optional[List[int]] = device_indexes
+        self.mesh_dp_size: int = int(mesh_dp_size)
         self._total_devices: int = int(
             math.prod(asdict(sharding_strategy).values()))
         if device_indexes:
-            assert self._total_devices == len(device_indexes)
+            # Under mesh-based DP the strategy describes ONE rank (dp has been
+            # collapsed to 1 and moved into mesh_dp_size), while the caller's
+            # device list covers the whole rollout mesh. The run needs
+            # mesh_dp_size x total_devices devices; mesh_dp_size == 1 reduces
+            # this to the original equality.
+            expected = self._total_devices * max(1, int(mesh_dp_size))
+            assert expected == len(device_indexes), (
+                f"device_indexes has {len(device_indexes)} entries but this "
+                f"config needs {expected} devices "
+                f"({self._total_devices} per rank x {mesh_dp_size} rank(s))")
         self.mm_encoder_tp_mode = mm_encoder_tp_mode
 
     @classmethod
@@ -313,10 +324,18 @@ class ShardingConfigManager:
             decode_context_parallelism=decode_context_parallelism,
             prefill_context_parallelism=prefill_context_parallelism)
 
-        # Must override here to avoid vLLM spinning up multiple DP engines.
-        # Both MPMD flavours *want* vLLM to spin them up -- multi-process DP as
-        # processes, mesh DP as threads -- so both are exempt.
-        if (not envs.TPU_MULTIPROCESS_DP and not envs.TPU_MESH_BASED_DP
+        inproc_mesh_dp = (envs.TPU_MESH_BASED_DP and (
+            os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") == "0"
+            or "proxy" in os.environ.get("JAX_PLATFORMS", "")))
+        mesh_dp_size = 1
+        if envs.TPU_MESH_BASED_DP:
+            recorded = int(os.environ.get("TPU_MESH_DP_SIZE", "0"))
+            mesh_dp_size = max(recorded, parallel_config.data_parallel_size)
+            if inproc_mesh_dp and mesh_dp_size > 1:
+                os.environ["TPU_MESH_DP_SIZE"] = str(mesh_dp_size)
+
+        if (not envs.TPU_MULTIPROCESS_DP
+                and (not envs.TPU_MESH_BASED_DP or inproc_mesh_dp)
                 and vllm_config.parallel_config.data_parallel_size > 1):
             vllm_config.parallel_config.data_parallel_size = 1
             vllm_config.parallel_config.data_parallel_rank = 0
@@ -327,7 +346,10 @@ class ShardingConfigManager:
         mm_encoder_tp_mode = vllm_config.additional_config.get(
             'mm-encoder-tp-mode', 'weights')
         cls.validate(vllm_config, sharding_strategy)
-        return cls(sharding_strategy, device_indexes, mm_encoder_tp_mode)
+        return cls(sharding_strategy,
+                   device_indexes,
+                   mm_encoder_tp_mode,
+                   mesh_dp_size=mesh_dp_size)
 
     @classmethod
     def validate(cls, vllm_config, sharding_strategy):

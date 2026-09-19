@@ -693,7 +693,15 @@ def get_flax_model(
     else:
         pooler_fn = _not_support
 
-    state_leaves = _packed_state_leaves
+    state_leaves = (
+        _packed_state_leaves
+        if os.environ.get("ENABLE_WEIGHT_PACKING", "0") == "1"
+        else _raw_state_leaves
+    )
+    _id_to_leaf_idx = {id(x): i for i, x in enumerate(_raw_state_leaves)}
+    compute_logits_fn.head_leaf_indices = tuple(
+        _id_to_leaf_idx[id(x)] for x in _head_leaves if id(x) in _id_to_leaf_idx
+    )
 
     # `runner/tpu_runner.py` and `runner/compilation_manager.py` read
     # `self.model.step_fn_no_options`, where `self.model` is

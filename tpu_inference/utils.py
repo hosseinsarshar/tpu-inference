@@ -213,11 +213,32 @@ def pathways_hbm_usage_gb(devices: Any) -> List[Tuple[float, float]]:
     seen_buffers = set()
 
     for array in live_arrays:
-        for buffer in array.addressable_shards:
-            buffer_id = id(buffer.data)
-            if buffer_id not in seen_buffers:
-                seen_buffers.add(buffer_id)
-                hbm_used[buffer.data.device] += buffer.data.nbytes
+        # jax.live_arrays() is a snapshot. Under mesh-based DP the other rank
+        # threads are deleting their own arrays concurrently (one
+        # collective_rpc("delete_kv_cache") reaches every rank at once), so an
+        # entry can be gone by the time we reach it. A deleted array holds no
+        # HBM, so it contributes nothing and is skipped. Single-threaded SPMD
+        # never takes this branch.
+        #
+        # Catch Exception, not RuntimeError. Teardown is not atomic, so a
+        # half-deleted array has more than one way to fail. `addressable_shards`
+        # is `[Shard(...) for a in self._arrays]`, and `_arrays` is set to None
+        # on the way down -- iterating that raises TypeError, not RuntimeError,
+        # and the narrower guard let it through. Seen at dp16/tp1, where 16 rank
+        # threads widen the window enough to hit it every run.
+        try:
+            shards = array.addressable_shards
+        except Exception:  # noqa: BLE001
+            continue
+        for buffer in shards:
+            try:
+                data = buffer.data
+                buffer_id = id(data)
+                if buffer_id not in seen_buffers:
+                    seen_buffers.add(buffer_id)
+                    hbm_used[data.device] += data.nbytes
+            except Exception:  # noqa: BLE001
+                continue
 
     return [(hbm_used[device], hbm_limit) for device in devices]
 

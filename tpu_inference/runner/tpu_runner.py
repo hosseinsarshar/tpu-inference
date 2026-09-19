@@ -1512,6 +1512,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # Cache a zero scalar JAX array to avoid eager allocation overhead during continue_decode cycles.
         self.zero_array = jnp.array(0, dtype=jnp.int32)
 
+    @property
+    def compute_logits_leaves(self):
+        indices = getattr(self, "_head_leaf_indices", None)
+        if indices:
+            return tuple(self.state_leaves[i] for i in indices)
+        return self.state_leaves
+
     def load_model(self):
         with set_current_vllm_config(self.vllm_config):
             model = get_model(
@@ -1550,9 +1557,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             self.state = model.state
             self.model = model.model
             self.state_leaves = model.state_leaves
-            self.compute_logits_leaves = getattr(model.compute_logits_fn,
-                                                 "head_leaves",
-                                                 self.state_leaves)
+            self._head_leaf_indices = getattr(model.compute_logits_fn,
+                                              "head_leaf_indices", None)
 
             if self.drafter is not None:
                 logger.info("Loading drafter model...")
