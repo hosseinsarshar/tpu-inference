@@ -156,6 +156,24 @@ def assign_device_groups(vllm_config: VllmConfig) -> List[List[Any]]:
             f"{len(devices)} are visible. Lower --data-parallel-size or "
             f"--tensor-parallel-size.")
 
+    if per_rank > 1:
+        devices = sorted(
+            devices,
+            key=lambda d: (
+                (
+                    d.coords[0] // 2,
+                    d.coords[1] // 2,
+                    d.coords[2],
+                    d.coords[0] % 2,
+                    d.coords[1] % 2,
+                    getattr(d, "core_on_chip", 0),
+                    d.id,
+                )
+                if hasattr(d, "coords") and len(getattr(d, "coords", ())) >= 3
+                else (getattr(d, "process_index", 0), d.id)
+            ),
+        )
+
     groups = [
         devices[r * per_rank:(r + 1) * per_rank] for r in range(dp_size)
     ]
