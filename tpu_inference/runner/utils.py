@@ -271,6 +271,8 @@ def get_token_paddings(min_token_size: int, max_token_size: int,
         while num < max_token_size:
             num += padding_gap
             paddings.append(num)
+    if os.environ.get("MESH_DP_SCALE_MAX_SEQS", "0") == "1" and max(paddings, default=0) >= 4096:
+        paddings = [p for p in paddings if p <= 64 or p >= 4096]
     logger.info(f"Prepared token paddings: {paddings}")
     return paddings
 
