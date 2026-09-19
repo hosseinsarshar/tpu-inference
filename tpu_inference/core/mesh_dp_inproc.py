@@ -524,8 +524,8 @@ class MeshDPEngineCore(vLLMEngineCore):
                 and os.environ.get("MESH_DP_SCALE_MAX_SEQS", "1") == "1"
                 and vllm_config.scheduler_config.max_num_seqs >= 64):
             orig_max_seqs = vllm_config.scheduler_config.max_num_seqs
-            # Next power-of-two multiple >= 2x (orig_max_seqs / dp_size), min 16
-            raw_target = max(16, ((orig_max_seqs + self.dp_size - 1) // self.dp_size) * 2)
+            # Next power-of-two multiple >= ceil(orig_max_seqs / dp_size), min 16
+            raw_target = max(16, (orig_max_seqs + self.dp_size - 1) // self.dp_size)
             pow2_target = 16
             while pow2_target < raw_target and pow2_target < orig_max_seqs:
                 pow2_target *= 2
