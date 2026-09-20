@@ -621,6 +621,8 @@ class MeshDPEngineCore(vLLMEngineCore):
         self.step_fn = self.step
 
         # --- orchestration state ---
+        self._rank0_warmup_done = threading.Event()
+        self._first_steps_sem = threading.Semaphore(4)
         self._router = _RankRouter(
             self.dp_size, self.vllm_config.scheduler_config.max_num_seqs)
         self._req_rank: Dict[str, int] = {}
@@ -725,13 +727,35 @@ class MeshDPEngineCore(vLLMEngineCore):
                 continue
 
             t_step = time.perf_counter()
-            try:
-                outputs, model_executed = engine.step_fn()
-                engine.post_step(model_executed=model_executed)
-            except Exception:
-                logger.exception("Mesh-based DP rank %d step failed", rank)
-                continue
-            st["steps"] += 1
+            if st["steps"] < 2 and self.dp_size > 16:
+                if rank == 0:
+                    try:
+                        outputs, model_executed = engine.step_fn()
+                        engine.post_step(model_executed=model_executed)
+                    except Exception:
+                        logger.exception("Mesh-based DP rank %d step failed", rank)
+                        continue
+                    st["steps"] += 1
+                    if st["steps"] >= 2:
+                        self._rank0_warmup_done.set()
+                else:
+                    self._rank0_warmup_done.wait(timeout=180.0)
+                    with self._first_steps_sem:
+                        try:
+                            outputs, model_executed = engine.step_fn()
+                            engine.post_step(model_executed=model_executed)
+                        except Exception:
+                            logger.exception("Mesh-based DP rank %d step failed", rank)
+                            continue
+                    st["steps"] += 1
+            else:
+                try:
+                    outputs, model_executed = engine.step_fn()
+                    engine.post_step(model_executed=model_executed)
+                except Exception:
+                    logger.exception("Mesh-based DP rank %d step failed", rank)
+                    continue
+                st["steps"] += 1
             st["busy_s"] += time.perf_counter() - t_step
 
             if outputs:
