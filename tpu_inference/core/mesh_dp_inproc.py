@@ -650,6 +650,10 @@ class MeshDPEngineCore(vLLMEngineCore):
         )
         self._router = _RankRouter(
             self.dp_size, self.vllm_config.scheduler_config.max_num_seqs)
+        self._round_robin_routing = (
+            os.environ.get("DP_SCHED_ROUTING", "round_robin").lower() == "round_robin"
+        )
+        self._rr_next_rank: int = 0
         self._req_rank: Dict[str, int] = {}
         self._req_rank_lock = threading.Lock()
         # Prompt-token count per request, needed to undo the router's
@@ -809,6 +813,11 @@ class MeshDPEngineCore(vLLMEngineCore):
 
     def _account(self, rank: int, eco: EngineCoreOutputs) -> None:
         """Update router load counters from a rank's own outputs."""
+        if getattr(self, "_round_robin_routing", False):
+            for out in eco.outputs:
+                if out.finish_reason is not None:
+                    self._forget_request(out.request_id, rank)
+            return
         for out in eco.outputs:
             rid = out.request_id
             num_new = len(out.new_token_ids) if out.new_token_ids else 0
@@ -849,6 +858,14 @@ class MeshDPEngineCore(vLLMEngineCore):
     # ------------------------------------------------------------------
 
     def add_request(self, request: Request, request_wave: int = 0) -> None:
+        if getattr(self, "_round_robin_routing", False):
+            rank = getattr(self, "_rr_next_rank", 0)
+            self._rr_next_rank = (rank + 1) % self.dp_size
+            self._stats[rank]["routed"] += 1
+            with self._req_rank_lock:
+                self._req_rank[request.request_id] = rank
+            self._in_q[rank].put_nowait(("add", request, request_wave))
+            return
         num_tokens = request.num_tokens
         # max_tokens is an upper bound (the request may stop early on EOS), but
         # it is the only forward-looking estimate available at routing time and
