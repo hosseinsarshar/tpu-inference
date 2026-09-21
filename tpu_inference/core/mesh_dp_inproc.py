@@ -646,7 +646,7 @@ class MeshDPEngineCore(vLLMEngineCore):
         # --- orchestration state ---
         self._rank0_warmup_done = threading.Event()
         self._first_steps_sem = threading.Semaphore(
-            int(os.environ.get("MESH_DP_COMPILE_CONCURRENCY", "64"))
+            int(os.environ.get("MESH_DP_COMPILE_CONCURRENCY", "128"))
         )
         self._router = _RankRouter(
             self.dp_size, self.vllm_config.scheduler_config.max_num_seqs)
