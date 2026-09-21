@@ -646,7 +646,7 @@ class MeshDPEngineCore(vLLMEngineCore):
         # --- orchestration state ---
         self._rank0_warmup_done = threading.Event()
         self._first_steps_sem = threading.Semaphore(
-            int(os.environ.get("MESH_DP_COMPILE_CONCURRENCY", "16"))
+            int(os.environ.get("MESH_DP_COMPILE_CONCURRENCY", "64"))
         )
         self._router = _RankRouter(
             self.dp_size, self.vllm_config.scheduler_config.max_num_seqs)
@@ -733,6 +733,7 @@ class MeshDPEngineCore(vLLMEngineCore):
         engine = self.engines[rank]
         inbox = self._in_q[rank]
         st = self._stats[rank]
+        lifetime_steps = 0
         while self._live:
             try:
                 self._drain_inbox(engine, inbox, rank)
@@ -756,7 +757,7 @@ class MeshDPEngineCore(vLLMEngineCore):
                 continue
 
             t_step = time.perf_counter()
-            if st["steps"] < 2:
+            if lifetime_steps < 2:
                 with self._first_steps_sem:
                     try:
                         outputs, model_executed = engine.step_fn()
@@ -764,6 +765,7 @@ class MeshDPEngineCore(vLLMEngineCore):
                     except Exception:
                         logger.exception("Mesh-based DP rank %d step failed fatally", rank)
                         os._exit(1)
+                lifetime_steps += 1
                 st["steps"] += 1
             else:
                 try:
@@ -772,6 +774,7 @@ class MeshDPEngineCore(vLLMEngineCore):
                 except Exception:
                     logger.exception("Mesh-based DP rank %d step failed fatally", rank)
                     os._exit(1)
+                lifetime_steps += 1
                 st["steps"] += 1
             st["busy_s"] += time.perf_counter() - t_step
 
