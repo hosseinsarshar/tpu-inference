@@ -56,6 +56,7 @@ Independence and dispatch, concretely:
 
 from __future__ import annotations
 
+import copy
 import os
 import queue
 import sys
@@ -85,13 +86,15 @@ logger = init_logger(__name__)
 _INSTALLED = False
 
 # How long a rank thread parks on its input queue when it has nothing to do.
-_IDLE_POLL_S = 0.02
+_IDLE_POLL_S = float(os.getenv("TPU_MESH_DP_IDLE_POLL_S", "0.5"))
 # How long the outer step() waits for the first output before reporting back to
 # vLLM empty-handed. Short enough to stay responsive, long enough not to spin.
 _STEP_WAIT_S = 0.05
 
 _DEVICE_GROUPS_ATTR = "mesh_dp_device_groups"
 _NEXT_RANK_ATTR = "mesh_dp_next_rank"
+_MEM_BARRIER_ATTR = "_mesh_dp_mem_barrier"
+_MEM_VALS_ATTR = "_mesh_dp_mem_vals"
 
 # One rank per thread means `dp_size` threads competing for a single GIL. A
 # step alternates between Python work and GIL-releasing device waits, and at
@@ -122,9 +125,12 @@ def is_mesh_dp_enabled(vllm_config: VllmConfig) -> bool:
 def assign_device_groups(vllm_config: VllmConfig) -> List[List[Any]]:
     """Split ``jax.devices()`` into one contiguous group per DP rank.
 
-    Each group becomes one rank's mesh. Unlike the multi-process path the
-    grouping is purely logical, so any split that divides the device list is
-    valid -- there is no physical-topology box to satisfy.
+    Orders each 2x2 host tile in a Hamiltonian 1-hop Gray-code cycle:
+      (0,0) -> (1,0) -> (1,1) -> (0,1)
+    so that:
+      - tp=2 gets 1 physical chip ([0,1], [2,3], [6,7], [4,5]),
+      - tp=4 gets 2 adjacent chips along X ([0,1,2,3] and [6,7,4,5]), matching SPMD,
+      - tp=8 gets a 1-hop Hamiltonian ring ([0,1,2,3,6,7,4,5]) with zero diagonal hops.
     """
     sharding_config = vllm_config.sharding_config
     dp_size = sharding_config.mesh_dp_size
@@ -164,8 +170,7 @@ def assign_device_groups(vllm_config: VllmConfig) -> List[List[Any]]:
                     d.coords[0] // 2,
                     d.coords[1] // 2,
                     d.coords[2],
-                    d.coords[0] % 2,
-                    d.coords[1] % 2,
+                    (d.coords[1] % 2) * 2 + ((d.coords[0] % 2) ^ (d.coords[1] % 2)),
                     getattr(d, "core_on_chip", 0),
                     d.id,
                 )
@@ -521,25 +526,41 @@ class MeshDPEngineCore(vLLMEngineCore):
         self.dp_size = vllm_config.sharding_config.mesh_dp_size
 
         if (self.dp_size > 1
-                and os.environ.get("MESH_DP_SCALE_MAX_SEQS", "1") == "1"
-                and vllm_config.scheduler_config.max_num_seqs >= 64):
+                and os.environ.get("MESH_DP_FORCE_UNSCALED_SEQS", "0") != "1"
+                and vllm_config.scheduler_config.max_num_seqs >= 32):
             orig_max_seqs = vllm_config.scheduler_config.max_num_seqs
-            # Next power-of-two multiple >= ceil(orig_max_seqs / dp_size), min 16
-            raw_target = max(16, (orig_max_seqs + self.dp_size - 1) // self.dp_size)
-            pow2_target = 16
-            while pow2_target < raw_target and pow2_target < orig_max_seqs:
-                pow2_target *= 2
-            vllm_config.scheduler_config.max_num_seqs = min(orig_max_seqs, pow2_target)
+            explicit_per_rank = int(os.environ.get("MESH_DP_PER_RANK_MAX_SEQS", "0"))
+            if explicit_per_rank > 0:
+                vllm_config.scheduler_config.max_num_seqs = explicit_per_rank
+            else:
+                # Next power-of-two multiple >= ceil(orig_max_seqs / dp_size), min 16
+                raw_target = max(16, (orig_max_seqs + self.dp_size - 1) // self.dp_size)
+                pow2_target = 16
+                while pow2_target < raw_target and pow2_target < orig_max_seqs:
+                    pow2_target *= 2
+                vllm_config.scheduler_config.max_num_seqs = min(orig_max_seqs, pow2_target)
+            orig_max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            default_cap = max(4096, 256 * vllm_config.scheduler_config.max_num_seqs)
+            per_rank_token_cap = int(os.environ.get("MESH_DP_MAX_BATCHED_TOKENS", str(default_cap)))
+            vllm_config.scheduler_config.max_num_batched_tokens = min(
+                orig_max_tokens,
+                max(per_rank_token_cap, vllm_config.scheduler_config.max_num_seqs),
+            )
             logger.info(
-                "Mesh-based DP | scaled per-rank max_num_seqs from %d to %d "
-                "across dp_size=%d (global capacity=%d)",
+                "Mesh-based DP | scaled per-rank max_num_seqs=%d->%d, "
+                "max_num_batched_tokens=%d->%d across dp_size=%d",
                 orig_max_seqs,
                 vllm_config.scheduler_config.max_num_seqs,
+                orig_max_tokens,
+                vllm_config.scheduler_config.max_num_batched_tokens,
                 self.dp_size,
-                vllm_config.scheduler_config.max_num_seqs * self.dp_size,
             )
 
         assign_device_groups(vllm_config)
+        setattr(vllm_config.device_config, _MEM_BARRIER_ATTR,
+                threading.Barrier(self.dp_size))
+        setattr(vllm_config.device_config, _MEM_VALS_ATTR,
+                [0] * self.dp_size)
 
         # Build the engines concurrently. Most of the ~2min per-engine cost is
         # XLA compilation and weight loading, which release the GIL, so this
@@ -550,9 +571,11 @@ class MeshDPEngineCore(vLLMEngineCore):
 
         def build(rank: int) -> None:
             _building.rank = rank
+            rank_cfg = copy.copy(vllm_config)
+            rank_cfg.cache_config = copy.copy(vllm_config.cache_config)
             try:
                 built[rank] = vLLMEngineCore(
-                    vllm_config,
+                    rank_cfg,
                     MeshDPExecutor,
                     log_stats,
                     executor_fail_callback,
@@ -622,7 +645,9 @@ class MeshDPEngineCore(vLLMEngineCore):
 
         # --- orchestration state ---
         self._rank0_warmup_done = threading.Event()
-        self._first_steps_sem = threading.Semaphore(4)
+        self._first_steps_sem = threading.Semaphore(
+            int(os.environ.get("MESH_DP_COMPILE_CONCURRENCY", "16"))
+        )
         self._router = _RankRouter(
             self.dp_size, self.vllm_config.scheduler_config.max_num_seqs)
         self._req_rank: Dict[str, int] = {}
@@ -727,34 +752,22 @@ class MeshDPEngineCore(vLLMEngineCore):
                 continue
 
             t_step = time.perf_counter()
-            if st["steps"] < 2 and self.dp_size > 16:
-                if rank == 0:
+            if st["steps"] < 2:
+                with self._first_steps_sem:
                     try:
                         outputs, model_executed = engine.step_fn()
                         engine.post_step(model_executed=model_executed)
                     except Exception:
-                        logger.exception("Mesh-based DP rank %d step failed", rank)
-                        continue
-                    st["steps"] += 1
-                    if st["steps"] >= 2:
-                        self._rank0_warmup_done.set()
-                else:
-                    self._rank0_warmup_done.wait(timeout=180.0)
-                    with self._first_steps_sem:
-                        try:
-                            outputs, model_executed = engine.step_fn()
-                            engine.post_step(model_executed=model_executed)
-                        except Exception:
-                            logger.exception("Mesh-based DP rank %d step failed", rank)
-                            continue
-                    st["steps"] += 1
+                        logger.exception("Mesh-based DP rank %d step failed fatally", rank)
+                        os._exit(1)
+                st["steps"] += 1
             else:
                 try:
                     outputs, model_executed = engine.step_fn()
                     engine.post_step(model_executed=model_executed)
                 except Exception:
-                    logger.exception("Mesh-based DP rank %d step failed", rank)
-                    continue
+                    logger.exception("Mesh-based DP rank %d step failed fatally", rank)
+                    os._exit(1)
                 st["steps"] += 1
             st["busy_s"] += time.perf_counter() - t_step
 

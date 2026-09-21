@@ -212,6 +212,10 @@ def get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int) -> int:
 def get_req_paddings(min_req_size: int, max_req_size: int) -> list[int]:
     # assert min_req_size is power of 2
     assert (min_req_size & (min_req_size - 1) == 0) and min_req_size > 0
+    if envs.TPU_MESH_BASED_DP and max_req_size <= 64:
+        paddings = [max_req_size]
+        logger.info(f"Prepared request paddings (mesh-dp pinned): {paddings}")
+        return paddings
     paddings: list = []
     num = max(MIN_NUM_SEQS, min_req_size)
     while num <= max_req_size and (len(paddings) == 0 or paddings[-1] != num):
@@ -271,8 +275,8 @@ def get_token_paddings(min_token_size: int, max_token_size: int,
         while num < max_token_size:
             num += padding_gap
             paddings.append(num)
-    if os.environ.get("MESH_DP_SCALE_MAX_SEQS", "0") == "1" and max(paddings, default=0) >= 4096:
-        paddings = [p for p in paddings if p <= 64 or p >= 4096]
+    if (envs.TPU_MESH_BASED_DP or os.environ.get("MESH_DP_SCALE_MAX_SEQS", "0") == "1") and max(paddings, default=0) >= 1024:
+        paddings = [paddings[0], paddings[-1]] if paddings[0] != paddings[-1] else [paddings[0]]
     logger.info(f"Prepared token paddings: {paddings}")
     return paddings
 

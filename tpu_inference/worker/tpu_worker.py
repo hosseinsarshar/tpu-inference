@@ -532,6 +532,14 @@ class TPUWorker(WorkerBase):
                                    self.rank - 1)
 
     def determine_available_memory(self) -> int:
+        barrier = getattr(self.device_config, "_mesh_dp_mem_barrier", None)
+        mem_vals = getattr(self.device_config, "_mesh_dp_mem_vals", None)
+        if barrier is not None:
+            try:
+                barrier.wait(timeout=300.0)
+            except Exception:
+                barrier = None
+
         gpu_memory_utilization = self.cache_config.gpu_memory_utilization
         hbm_usage = utils.hbm_usage_bytes(self.devices)
         total_hbm_limit = total_hbm_used = 0
@@ -574,6 +582,18 @@ class TPUWorker(WorkerBase):
                 logger.info(
                     f"  ALERT: KV offloading enabled. Deducting {stage_buffer_size_bytes} Bytes ({staging_buffer_pages} pages) from available HBM for staging buffer."
                 )
+
+        if barrier is not None and mem_vals is not None:
+            dp_idx = self.parallel_config.data_parallel_index
+            if 0 <= dp_idx < len(mem_vals):
+                mem_vals[dp_idx] = total_hbm_avail
+            try:
+                barrier.wait(timeout=300.0)
+                valid_vals = [v for v in mem_vals if v > 0]
+                if valid_vals:
+                    total_hbm_avail = min(valid_vals)
+            except Exception:
+                pass
 
         total_hbm_avail_gb = round(total_hbm_avail / utils.GBYTES, 2)
 

@@ -391,7 +391,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stop at their own EOS (the <=N-1 extra tokens are masked like a normal
     # stop), so the sampled distribution is unchanged. Default 1 = stock.
     "CONTINUE_DECODE_EOS_CHECK_INTERVAL":
-    lambda: int(os.getenv("CONTINUE_DECODE_EOS_CHECK_INTERVAL") or "1"),
+    lambda: int(os.getenv("CONTINUE_DECODE_EOS_CHECK_INTERVAL") or "16"),
     # continue_decode: after a step whose prefills all complete, keep going
     # into the fused decode loop instead of returning to the scheduler. Without
     # this the loop only runs when the batch is *already* decode-only, which
@@ -414,7 +414,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # one convoys the ranks, and each contended acquire is itself a handoff, so
     # the small enqueues lose more to the lock than their ~2.4 switches cost.
     "MESH_DP_DISPATCH_LOCK":
-    lambda: int(os.getenv("MESH_DP_DISPATCH_LOCK") or "1"),
+    lambda: (
+        1
+        if os.getenv("MESH_DP_FORCE_DISPATCH_LOCK", "1") == "1"
+        else int(os.getenv("MESH_DP_DISPATCH_LOCK") or "1")
+    ),
     # Break a host step down into its phases (input prep, H2D, each jit
     # dispatch, D2H) and log the per-step budget. Mesh DP is GIL-bound, so the
     # question is always which Python is holding the GIL, and a GIL profile

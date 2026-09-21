@@ -1054,9 +1054,20 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         return nullcontext()
 
     @functools.cached_property
-    def _dispatch_lock(self):
-        """The model dispatch's lock. See `_dispatch_lock_at`."""
+    def _dispatch_lock_warm(self):
         return self._dispatch_lock_at(1)
+
+    @property
+    def _dispatch_lock(self):
+        """The model dispatch's lock.
+
+        Skip locking until the rank has finished its first continue_decode
+        execution (`_cd_compiled=True`), so both initial prefill and
+        continue_decode compilations run concurrently across all DP ranks.
+        """
+        if not getattr(self, "_cd_compiled", False):
+            return nullcontext()
+        return self._dispatch_lock_warm
 
     @functools.cached_property
     def _enqueue_lock(self):
@@ -1277,6 +1288,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             sharding_config.prefill_cp_size,
         )
 
+        if envs.TPU_MESH_BASED_DP:
+            return np.array(self.devices).reshape(mesh_shape)
+
         if envs.TPU_MESH_SORT_BY_COORDS:
             sorted_devices = sorted(self.devices,
                                     key=lambda x:
@@ -1468,6 +1482,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             self.dp_size,
             padding_gap=envs.VLLM_TPU_BUCKET_PADDING_GAP,
             additional_sizes=additional_sizes)
+        if envs.TPU_MESH_BASED_DP and self.max_num_reqs <= 32:
+            self.num_tokens_paddings = sorted(
+                {max(16, self.max_num_reqs), self.num_tokens_paddings[-1]}
+            )
+            logger.info(
+                "Mesh-based DP | pinned num_tokens_paddings to single "
+                "decode+prefill buckets: %s",
+                self.num_tokens_paddings,
+            )
         self.num_tokens_paddings_per_dp = [
             padding // self.dp_size for padding in self.num_tokens_paddings
         ]
@@ -2594,7 +2617,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
              set_forward_context(None, self.vllm_config), \
              self.maybe_get_kv_connector_output(
                  scheduler_output) as kv_connector_output, \
-             self._phase("cd_loop"), self._enqueue_lock:
+             self._phase("cd_loop"), self._dispatch_lock:
             (generated_tokens, final_kv_caches, final_state, final_rng,
              all_expert_indices, logprobs_tensors) = continue_decode(
                  state=self.state_leaves,
@@ -2626,6 +2649,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                  continue_decode_eos_check_interval=self.
                  continue_decode_eos_check_interval,
              )
+        self._cd_compiled = True
 
         if self.scheduler_config.async_scheduling:
             self.rng_params_for_sampling = final_rng
