@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import functools
 import logging
+import os
 import random
+import resource
 import sys
-from contextlib import nullcontext
+import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
@@ -181,6 +185,28 @@ REASON_MAX_STEPS = "max_steps"
 REASON_MAX_DECODE_STEPS_LIMIT = "max_decode_steps_limit"
 REASON_KV_CACHE_LIMIT = "kv_cache_limit"
 REASON_UNKNOWN = "unknown"
+
+
+@functools.lru_cache(maxsize=8)
+def _pick_last_step_tokens(static_max_decode_steps: int):
+    """Gather each row's token at its own final decode step, in one dispatch.
+
+    Written eagerly this is four dispatches (subtract, clip, arange, gather)
+    plus a fresh `jnp.arange` allocation, issued once per rank per host step --
+    and mesh-based DP multiplies every per-step dispatch by dp_size.
+
+    Cached on `static_max_decode_steps` because it is baked in as the clip bound.
+    """
+
+    @jax.jit
+    def pick(generated_tokens: jax.Array,
+             step_counter: jax.Array) -> jax.Array:
+        last_step_idx = jnp.clip(step_counter - 1, 0,
+                                 static_max_decode_steps - 1)
+        return generated_tokens[last_step_idx,
+                                jnp.arange(generated_tokens.shape[1])]
+
+    return pick
 
 
 def _log_continue_decode_summary(
@@ -936,6 +962,277 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             "max_decode_steps", DEFAULT_MAX_DECODE_STEPS)
         self.eos_token_id = runner_utils.get_eos_token_id(self.model_config)
         self.pad_token_id = runner_utils.get_pad_token_id(self.model_config)
+        # Diagnostics for the continue_decode gate. `is_decode_only` is a
+        # property of the *whole* batch, so under SPMD DP one prefill on any
+        # rank disables the fused loop for every rank. These counters attribute
+        # steps to the three cases so the cost of the global gate is
+        # measurable rather than inferred. Off by default (one dict lookup per
+        # step when on).
+        self._cd_gate_stats = envs.CONTINUE_DECODE_GATE_STATS
+        self._cd_gate_counts = {
+            "decode_only": 0,  # gate fires today
+            "prefill_completes": 0,  # decode-only *after* this step
+            "prefill_partial": 0,  # chunked prefill still in flight
+        }
+        # Set for a step that will chain the fused decode loop onto a mixed
+        # forward; carries the sampled tokens that seed the loop.
+        self._cd_chain_pending = False
+        self._cd_chain_next_tokens: jax.Array | None = None
+        # Positive control for the chained path. The gate counters above are
+        # recorded before `_can_chain_continue_decode`, so they read the same
+        # whether or not chaining is reachable -- an A/B on
+        # CONTINUE_DECODE_AFTER_PREFILL that only watched them would look
+        # identical in both arms even with the feature entirely disabled.
+        # `fired` counts steps that actually ran the loop, `bailed` counts
+        # steps that reached `_continue_decode_after_prefill` and returned
+        # early anyway (no slots left, logprobs requested).
+        self._cd_chain_fired = 0
+        self._cd_chain_bailed = 0
+        self._cd_chain_tokens = 0
+        # Per-phase host budget for one step. See `_phase`.
+        self._phase_stats = envs.HOST_PHASE_STATS
+        self._phase_us: dict[str, float] = {}
+        self._phase_cpu_us: dict[str, float] = {}
+        # Worst single occurrence, so a mean built from a few long stalls can
+        # be told apart from a genuinely expensive per-step phase. See `_split`.
+        self._phase_max_us: dict[str, float] = {}
+        # Open `_phase` frames, innermost last, each accumulating the time its
+        # children took so a parent can report self time. A runner is driven by
+        # exactly one thread (one per rank under mesh DP), so a plain list is
+        # enough.
+        self._phase_stack: list[list[float]] = []
+        # Voluntary context switches per phase. See `_nvcsw`.
+        self._phase_sw: dict[str, int] = {}
+        self._split_t0 = 0.0
+        self._split_c0 = 0.0
+        self._split_v0 = 0
+        self._phase_steps = 0
+        # See `_init_dispatch_probe`; inert unless TPU_MESH_DP_PROBE_DISPATCH.
+        self._probe_n = 0
+        self._probe_fn = None
+
+    @functools.cached_property
+    def _fuse_h2d_metadata(self) -> bool:
+        """Whether `positions`/`request_distribution` ride in the metadata blob.
+
+        A `jax.device_put` costs a near-constant ~110us per *leaf* on TPU almost
+        independently of size, so the 12-byte `request_distribution` is about as
+        expensive to ship as the whole 26KB blob. It does release the GIL, but
+        the transfer path is globally serialised, so eight ranks putting three
+        leaves each queue behind one another. Folding them in makes a step one
+        H2D leaf instead of three.
+
+        The blob is 1-D and placed with P(BATCH) while `positions` wants
+        P(ATTN_DATA); those describe the same placement only when both axes are
+        single-device. That is exactly the mesh-DP shape, and also the only
+        shape that pays for the extra leaves.
+        """
+        if (not envs.FUSE_H2D_METADATA or self.uses_mrope
+                or self.kv_cache_config.has_mamba_layers):
+            return False
+        shape = self.mesh.shape
+        return (shape.get(ShardingAxisName.BATCH, 1) == 1
+                and shape.get(ShardingAxisName.ATTN_DATA, 1) == 1)
+
+    def _dispatch_lock_at(self, level: int):
+        """Serialises one enqueue against this process's other ranks.
+
+        A no-op outside mesh DP: every other mode has one runner per process,
+        so the lock would always be uncontended and would only cost an acquire.
+        See `runner_utils.dispatch_lock` for why serialising wins.
+
+        `level` is the setting of `MESH_DP_DISPATCH_LOCK` at which this site
+        starts locking: 1 for the model dispatch, which is worth 32.6 of a
+        step's 60.5 handoffs on its own, and 2 for the smaller enqueues, which
+        are worth ~2.4 each. Only 1 is on by default -- the smaller enqueues
+        measured worse locked than unlocked, because six contended acquires a
+        step convoy the ranks for less than they save. See `envs.py`.
+        """
+        if (envs.TPU_MESH_BASED_DP
+                and envs.MESH_DP_DISPATCH_LOCK >= level):
+            return runner_utils.dispatch_lock()
+        return nullcontext()
+
+    @functools.cached_property
+    def _dispatch_lock(self):
+        """The model dispatch's lock. See `_dispatch_lock_at`."""
+        return self._dispatch_lock_at(1)
+
+    @functools.cached_property
+    def _enqueue_lock(self):
+        """The smaller enqueues' lock. See `_dispatch_lock_at`."""
+        return self._dispatch_lock_at(2)
+
+    @staticmethod
+    def _nvcsw() -> int:
+        """This thread's voluntary context switches so far.
+
+        Under mesh DP a rank thread's voluntary switches are almost entirely
+        GIL handoffs: it drops the GIL around a C call, sleeps on the condvar
+        and is woken by whoever hands it back. The round trip is ~190us, so a
+        phase's switch count is a better predictor of what it costs the step
+        than either its wall or its CPU time. `getrusage` costs 0.6us and does
+        not itself release the GIL, so counting does not change what is
+        counted.
+        """
+        return resource.getrusage(resource.RUSAGE_THREAD).ru_nvcsw
+
+    @contextmanager
+    def _phase(self, name: str):
+        """Accumulate wall, this thread's CPU time, and GIL handoffs for a phase.
+
+        Wall alone cannot rank fixes under mesh DP. Eight rank threads share one
+        GIL, so a phase that does 100us of Python shows up as ~800us of wall
+        once the other seven ranks queue behind it, and a phase that only blocks
+        on the device shows up just as large. CPU time separates them: it counts
+        only cycles this thread actually ran, so `cpu` is the work a fix could
+        remove and `wall - cpu` is contention or device wait.
+
+        Phases nest (`h2d` and `unpack` sit inside `prep`), so a leaf records
+        self time -- its own minus its children's -- and the rows then add up to
+        the step instead of counting the inner ones twice. `TOTAL_*` rows are
+        the denominator, so those stay inclusive.
+        """
+        if not self._phase_stats:
+            yield
+            return
+        stack = self._phase_stack
+        stack.append([0.0, 0.0, 0])
+        t0 = time.perf_counter()
+        c0 = time.thread_time()
+        v0 = self._nvcsw()
+        try:
+            yield
+        finally:
+            dt = (time.perf_counter() - t0) * 1e6
+            dc = (time.thread_time() - c0) * 1e6
+            dv = self._nvcsw() - v0
+            child_dt, child_dc, child_dv = stack.pop()
+            if stack:
+                stack[-1][0] += dt
+                stack[-1][1] += dc
+                stack[-1][2] += dv
+            if not name.startswith("TOTAL_"):
+                dt -= child_dt
+                dc -= child_dc
+                dv -= child_dv
+            self._phase_us[name] = self._phase_us.get(name, 0.0) + dt
+            self._phase_cpu_us[name] = self._phase_cpu_us.get(name, 0.0) + dc
+            self._phase_sw[name] = self._phase_sw.get(name, 0) + dv
+            if dt > self._phase_max_us.get(name, 0.0):
+                self._phase_max_us[name] = dt
+
+    def _init_dispatch_probe(self) -> None:
+        """Diagnostic: inject N extra no-op dispatches of K leaves per step.
+
+        Off-line, one jit dispatch of 340 array leaves costs 99us from a single
+        thread but 748us once eight threads do it at once -- 8 threads deliver
+        1.02x the dispatches/s of one, i.e. the per-leaf argument validation is
+        completely serialised. Dropping to 15 leaves buys 4.68x. That says
+        stacking the 28 layers' weights into one array per parameter kind is the
+        lever, but it is a real refactor, so measure the slope first: adding a
+        dispatch of a known leaf count and watching throughput fall gives the
+        marginal in-system cost of one directly.
+
+        `TPU_MESH_DP_PROBE_DISPATCH=<count>:<leaves>`, e.g. "1:340" or "1:15".
+        """
+        spec = os.getenv("TPU_MESH_DP_PROBE_DISPATCH", "")
+        leaves_avail = getattr(self, "state_leaves", None)
+        if not spec or not leaves_avail:
+            return
+        count, _, leaves = spec.partition(":")
+        self._probe_n = int(count)
+        k = min(int(leaves or 0), len(leaves_avail))
+        self._probe_args = list(leaves_avail[:k])
+        self._probe_fn = jax.jit(lambda xs: xs[0].reshape(-1)[:1] + 1)
+        # Warm it under the same mesh context the step runs in, or the first
+        # in-step call trips `ForbidCompile`.
+        with jax.set_mesh(self.mesh):
+            jax.block_until_ready(self._probe_fn(self._probe_args))
+        logger.info("dispatch probe: %d extra dispatches of %d leaves/step",
+                    self._probe_n, k)
+
+    def _split_begin(self) -> None:
+        """Start a run of `_split` segments. See `_split`."""
+        if self._phase_stats:
+            self._split_t0 = time.perf_counter()
+            self._split_c0 = time.thread_time()
+            self._split_v0 = self._nvcsw()
+
+    def _split(self, name: str) -> None:
+        """Charge the time since the previous split (or `_split_begin`) to `name`.
+
+        The same accounting as `_phase` for straight-line stretches where a
+        `with` block would mean reindenting a hundred lines -- `_prepare_inputs`
+        is 40%+ of the host step and is one long function, so it needs to be
+        broken up without being restructured. Segments must not contain a
+        `_phase`, or the enclosing phase would have their time deducted twice.
+        """
+        if not self._phase_stats:
+            return
+        now, cpu, sw = time.perf_counter(), time.thread_time(), self._nvcsw()
+        dt = (now - self._split_t0) * 1e6
+        dc = (cpu - self._split_c0) * 1e6
+        dv = sw - self._split_v0
+        self._split_t0, self._split_c0, self._split_v0 = now, cpu, sw
+        if self._phase_stack:
+            self._phase_stack[-1][0] += dt
+            self._phase_stack[-1][1] += dc
+            self._phase_stack[-1][2] += dv
+        self._phase_us[name] = self._phase_us.get(name, 0.0) + dt
+        self._phase_cpu_us[name] = self._phase_cpu_us.get(name, 0.0) + dc
+        self._phase_sw[name] = self._phase_sw.get(name, 0) + dv
+        # A mean says nothing about shape. `p_asyncif` averages 805us of CPU
+        # over a stretch that is one `if`, and that `if` measures 49ns in
+        # isolation -- a 16000x gap. Either it really costs that on every step
+        # (impossible) or a handful of multi-second stalls are being divided by
+        # the step count. The max separates the two, and only one of them is
+        # worth optimising.
+        if dt > self._phase_max_us.get(name, 0.0):
+            self._phase_max_us[name] = dt
+
+    def _prepare_inputs_timed(self, scheduler_output):
+        """`_prepare_inputs` plus the once-per-step phase bookkeeping."""
+        self._phase_step_done()
+        with self._phase("prep"):
+            return self._prepare_inputs(scheduler_output)
+
+    def _phase_step_done(self) -> None:
+        if not self._phase_stats:
+            return
+        self._phase_steps += 1
+        if self._phase_steps % 200:
+            return
+        n = self._phase_steps
+        # TOTAL_* phases wrap the others, so they are the denominator rather
+        # than another row; whatever they do not account for is host work no
+        # timer covers yet.
+        totals = {k: v for k, v in self._phase_us.items()
+                  if k.startswith("TOTAL_")}
+        leaves = {k: v for k, v in self._phase_us.items()
+                  if not k.startswith("TOTAL_")}
+        total = sum(totals.values()) or sum(leaves.values())
+        # `cpu` is this thread's own CPU time, so it is the part of the wall a
+        # fix could actually delete; the gap is GIL queueing or device wait.
+        # `sw` is voluntary context switches per step, i.e. GIL handoffs. At
+        # ~190us of sleep/wake round trip each they are what a fix should be
+        # ranked on; a phase can be cheap in CPU and still dominate the step.
+        parts = " ".join(
+            f"{k}={v/n:.0f}/{self._phase_cpu_us.get(k, 0.0)/n:.0f}us"
+            f"({100*v/total:.0f}%,max{self._phase_max_us.get(k, 0.0)/1000:.0f}ms"
+            f",sw{self._phase_sw.get(k, 0)/n:.1f})"
+            for k, v in sorted(leaves.items(), key=lambda kv: -kv[1]))
+        other = total - sum(leaves.values())
+        cpu_leaves = sum(self._phase_cpu_us.get(k, 0.0) for k in leaves)
+        cpu_total = sum(self._phase_cpu_us.get(k, 0.0) for k in totals) or \
+            cpu_leaves
+        sw_total = sum(self._phase_sw.get(k, 0) for k in totals) or \
+            sum(self._phase_sw.get(k, 0) for k in leaves)
+        logger.info(
+            "host phases over %d steps (wall/cpu) | step=%.0fus cpu=%.0fus"
+            " (%.0f%% of wall) sw=%.1f/step | %s other=%.0f/%.0fus(%.0f%%)", n,
+            total / n, cpu_total / n, 100 * cpu_total / total, sw_total / n,
+            parts, other / n, (cpu_total - cpu_leaves) / n, 100 * other / total)
 
     def _init_random(self):
         if self.model_config.seed is None:
@@ -1073,7 +1370,21 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # same JAX worker id). Without a per-rank segment they collide on
             # the second-resolution timestamp dir and one rank's capture
             # overwrites another's.
-            dp_rank = self.parallel_config.data_parallel_index if envs.TPU_MULTIPROCESS_DP else 0
+            # Set for every DP rank under both MPMD flavours, and 0 otherwise.
+            dp_rank = self.parallel_config.data_parallel_index
+            # Mesh DP puts every rank in ONE process as a thread, and the JAX
+            # profiler is process-wide: the second rank to call start_trace
+            # dies with "profiler is already active". Always let rank 0 drive
+            # the capture so `PhasedBasedProfiler._resolve_canonical_dst_ts`
+            # writes the canonical timestamp marker immediately instead of
+            # timing out for 5s waiting for rank 0.
+            if envs.TPU_MESH_BASED_DP and dp_rank != 0:
+                return
+            if not runner_utils.claim_process_profiler():
+                logger.info(
+                    "Phased profiling already claimed by another rank in this "
+                    "process; this rank will not drive the profiler.")
+                return
             self.phase_based_profiler = runner_utils.PhasedBasedProfiler(
                 self.phased_profiling_dir, worker_rank=dp_rank)
 
@@ -1272,6 +1583,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # Cache a zero scalar JAX array to avoid eager allocation overhead during continue_decode cycles.
         self.zero_array = jnp.array(0, dtype=jnp.int32)
 
+    @property
+    def compute_logits_leaves(self):
+        indices = getattr(self, "_head_leaf_indices", None)
+        if indices:
+            return tuple(self.state_leaves[i] for i in indices)
+        return self.state_leaves
+
     def load_model(self):
         with set_current_vllm_config(self.vllm_config):
             model = get_model(
@@ -1310,15 +1628,52 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             self.state = model.state
             self.model = model.model
             self.state_leaves = model.state_leaves
+            self._head_leaf_indices = getattr(model.compute_logits_fn,
+                                              "head_leaf_indices", None)
 
             if self.drafter is not None:
                 logger.info("Loading drafter model...")
                 self.drafter.load_model(self.state)
 
+        self._init_dispatch_probe()
+
         self.model_fn = model.model_fn
         self.compute_logits_fn = model.compute_logits_fn
         self.pooler_fn = model.pooler_fn
         self.combine_hidden_states_fn = model.combine_hidden_states_fn
+        self._prefused_sample = None
+
+        mesh = self.mesh
+        logits_fn = self.compute_logits_fn
+
+        @functools.partial(
+            jax.jit,
+            static_argnames=("allow_distributed_sampling", ),
+        )
+        def _logits_and_sample_fn(
+            head_leaves,
+            hidden_states,
+            lora_metadata,
+            rng,
+            sampling_metadata,
+            allow_distributed_sampling: bool = True,
+        ):
+            from tpu_inference.layers.jax.sample.sampling import sample
+            logits = logits_fn(head_leaves, hidden_states, lora_metadata)
+            if sampling_metadata.do_sampling:
+                next_rng, step_rng = jax.random.split(rng)
+            else:
+                next_rng, step_rng = rng, rng
+            next_tokens, processed_logits = sample(
+                step_rng,
+                mesh,
+                logits,
+                sampling_metadata,
+                allow_distributed_sampling=allow_distributed_sampling,
+            )
+            return next_tokens, processed_logits, next_rng
+
+        self.logits_and_sample_fn = _logits_and_sample_fn
         # For the flax_nnx path, `model_fn` (== `run_model`) accepts a flat
         # tuple of array leaves and reconstructs the nnx.State inside the
         # jit. Pre-flatten here so subsequent dispatches skip the per-call
@@ -1330,12 +1685,26 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.embed_input_ids_fn = model.multimodal_fns.embed_input_ids_fn
         self.get_mrope_input_positions_fn = model.multimodal_fns.get_mrope_input_positions_fn
 
-        rng_key = nnx.Rngs(jax.random.key(self.model_config.seed)).params()
+        rng_key = jax.random.PRNGKey(self.model_config.seed)
         self.rng_params_for_sampling = device_array(self.mesh,
                                                     rng_key,
                                                     sharding=NamedSharding(
                                                         self.mesh,
                                                         PartitionSpec()))
+        # On a 1-device mesh (e.g. mesh-based DP with tp=1), @jax.jit functions
+        # (including jax.random.split and logits_and_sample_fn) canonicalize
+        # their output sharding to SingleDeviceSharding(device), which hashes to
+        # a different C++ pjit cache key than NamedSharding(mesh, PartitionSpec()).
+        # Splitting once here ensures self.rng_params_for_sampling has the exact
+        # post-jit sharding before _precompile_sampling runs.
+        self.rng_params_for_sampling, _ = jax.random.split(
+            self.rng_params_for_sampling)
+        self._scalar_sharding = (self.mesh.devices.flat[0]
+                                 if self.mesh.size == 1 else NamedSharding(
+                                     self.mesh, PartitionSpec()))
+        self.zero_array = jax.device_put(np.array(0, dtype=np.int32),
+                                         self._scalar_sharding)
+        self._max_decode_steps_arrays: dict[int, jax.Array] = {}
         # This allows a multi-modal model to be used as text-only, assuming the user
         # passes the following to vLLM (on the CLI):
         # --limit-mm-per-prompt '{"image": 0, "video": 0}'
@@ -1462,7 +1831,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 self.input_batch, scheduler_output)
 
         with jax.set_mesh(self.mesh), jax.profiler.TraceAnnotation(
-                f"execute_model: {reqs} reqs, {toks} toks", **req_id_kwargs):
+                f"execute_model: {reqs} reqs, {toks} toks", **req_id_kwargs), \
+                self._phase("TOTAL_execute_model"):
             output = self._execute_model(scheduler_output,
                                          intermediate_tensors)
         return output
@@ -1504,7 +1874,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
          )
         self.execute_model_state = None
 
-        with jax.set_mesh(self.mesh):
+        with jax.set_mesh(self.mesh), self._phase("TOTAL_sample_tokens"):
             if grammar_output is not None:
                 (
                     require_struct_decoding, grammar_bitmask_padded, arange
@@ -1516,12 +1886,17 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     logits,
                     arange,
                 )
-            return self._sample_from_logits(
+            output = self._sample_from_logits(
                 scheduler_output, attn_metadata, sampling_metadata, input_ids,
                 hidden_states, logits, aux_hidden_states, spec_decode_metadata,
                 kv_connector_output, logits_indices_selector, padded_num_reqs,
                 expert_indices, full_hidden_states, full_logits, req_ids_dp,
                 padded_num_scheduled_tokens_per_dp_rank)
+            if self._cd_chain_pending:
+                self._cd_chain_pending = False
+                output = self._continue_decode_after_prefill(
+                    scheduler_output, output)
+            return output
 
     def _modify_prev_results(self):
         # If copy to host has not been done, we just wait.
@@ -1700,6 +2075,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         # Check if the entire batch is in the decode phase.
         # request_distribution[0] tracks the number of decode requests.
+        self._cd_chain_pending = False
         is_decode_only = self.input_batch.request_distribution[
             0] == self.input_batch.num_reqs
         has_structured_output = getattr(scheduler_output,
@@ -1707,7 +2083,24 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                         False)
         if (is_decode_only and self.enable_continue_decode
                 and not has_structured_output):
+            if self._cd_gate_stats:
+                self._record_cd_gate("decode_only")
             return self._execute_continue_decode(scheduler_output)
+
+        if self.enable_continue_decode:
+            # Relaxed gate: the batch is not decode-only *now*, but if every
+            # prefill it contains completes in this forward it will be from
+            # here on -- so run the mixed step and then chain straight into the
+            # fused loop rather than handing a single token back to the
+            # scheduler. This matters most under SPMD DP, where is_decode_only
+            # is a property of the whole global batch and one prefill on one
+            # rank costs all `dp_size` ranks the fused loop.
+            will_be_decode_only = self._will_be_decode_only(scheduler_output)
+            if self._cd_gate_stats:
+                self._record_cd_gate("prefill_completes" if will_be_decode_only
+                                     else "prefill_partial")
+            self._cd_chain_pending = (will_be_decode_only
+                                      and self._can_chain_continue_decode())
 
         # TODO(pooyam): I guess we can remove returning sampling_metadata in `_prepare_inputs` after https://github.com/njhill/vllm/commit/b7433ca1a47732394b1bdea4099d98389515954b
         (
@@ -1723,7 +2116,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             padded_num_scheduled_tokens_per_dp_rank,
             _,
             shared_attn_metadata,
-        ) = self._prepare_inputs(scheduler_output)
+        ) = self._prepare_inputs_timed(scheduler_output)
 
         # multi-modal support
         if self.is_multimodal_model:
@@ -1770,21 +2163,58 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     scheduler_output) as kv_connector_output:
                 # NOTE(Wenlong): It takes both `input_ids` and `inputs_embeds`,
                 # but one of them would be `None`
-                (self.kv_caches, hidden_states, aux_hidden_states,
-                 expert_indices) = self.model_fn(
-                     self.state_leaves,
-                     self.kv_caches,
-                     input_ids,
-                     attn_metadata,
-                     inputs_embeds,
-                     input_positions,
-                     tuple(self.layer_name_to_kvcache_index.items()),
-                     lora_metadata,
-                     intermediate_tensors,
-                     self.is_first_rank,
-                     self.is_last_rank,
-                     shared_attention_metadata=shared_attn_metadata,
-                 )
+                if self._probe_fn is not None:
+                    with self._phase("probe"):
+                        for _ in range(self._probe_n):
+                            self._probe_out = self._probe_fn(self._probe_args)
+                # The lock is inside the phase so that time spent waiting for
+                # it is charged to `model_fn` rather than disappearing.
+                can_fuse_logits_and_sample = (
+                    self.is_last_rank and not self.is_pooling_model
+                    and not self.input_batch.num_prompt_logprobs
+                    and spec_decode_metadata is None
+                    and not getattr(scheduler_output,
+                                    "has_structured_output_requests", False))
+                self._prefused_sample = None
+                with self._phase("model_fn"), self._dispatch_lock:
+                    (self.kv_caches, hidden_states, aux_hidden_states,
+                     expert_indices) = self.model_fn(
+                         self.state_leaves,
+                         self.kv_caches,
+                         input_ids,
+                         attn_metadata,
+                         inputs_embeds,
+                         input_positions,
+                         tuple(self.layer_name_to_kvcache_index.items()),
+                         lora_metadata,
+                         intermediate_tensors,
+                         self.is_first_rank,
+                         self.is_last_rank,
+                         shared_attention_metadata=shared_attn_metadata,
+                     )
+                if can_fuse_logits_and_sample:
+                    full_hidden_states = hidden_states
+                    with self._phase("select"), self._enqueue_lock:
+                        hidden_states = self._select_from_array_fn(
+                            hidden_states, logits_indices, self.mesh,
+                            self.vllm_config.sharding_config.prefill_cp_size)
+                    allow_dist = distributed_sampling_allowed(
+                        sampling_metadata.logprobs,
+                        self.model_config.logprobs_mode)
+                    with self._phase("sample"), self._enqueue_lock:
+                        (next_tokens, processed_logits,
+                         self.rng_params_for_sampling) = (
+                             self.logits_and_sample_fn(
+                                 self.compute_logits_leaves,
+                                 hidden_states,
+                                 lora_metadata,
+                                 self.rng_params_for_sampling,
+                                 sampling_metadata,
+                                 allow_distributed_sampling=allow_dist,
+                             ))
+                    self._prefused_sample = (next_tokens, processed_logits)
+                    logits = processed_logits
+                    full_logits = None
             if not self.is_last_rank:
                 assert isinstance(hidden_states, JaxIntermediateTensors)
                 hidden_states.kv_connector_output = kv_connector_output
@@ -1825,28 +2255,31 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 pooler_output=pooler_output,
             )
 
-        full_hidden_states = hidden_states
+        if not can_fuse_logits_and_sample:
+            full_hidden_states = hidden_states
 
-        if self.input_batch.num_prompt_logprobs:
-            # Compute logits for ALL token positions once.
-            full_logits = self.compute_logits_fn(
-                self.state_leaves,
-                full_hidden_states,
-                lora_metadata,
-            )
-            logits = self._select_from_array_fn(
-                full_logits, logits_indices, self.mesh,
-                self.vllm_config.sharding_config.prefill_cp_size)
-        else:
-            full_logits = None
-            hidden_states = self._select_from_array_fn(
-                hidden_states, logits_indices, self.mesh,
-                self.vllm_config.sharding_config.prefill_cp_size)
-            logits = self.compute_logits_fn(
-                self.state_leaves,
-                hidden_states,
-                lora_metadata,
-            )
+            if self.input_batch.num_prompt_logprobs:
+                # Compute logits for ALL token positions once.
+                full_logits = self.compute_logits_fn(
+                    self.compute_logits_leaves,
+                    full_hidden_states,
+                    lora_metadata,
+                )
+                logits = self._select_from_array_fn(
+                    full_logits, logits_indices, self.mesh,
+                    self.vllm_config.sharding_config.prefill_cp_size)
+            else:
+                full_logits = None
+                with self._phase("select"), self._enqueue_lock:
+                    hidden_states = self._select_from_array_fn(
+                        hidden_states, logits_indices, self.mesh,
+                        self.vllm_config.sharding_config.prefill_cp_size)
+                with self._phase("compute_logits"), self._enqueue_lock:
+                    logits = self.compute_logits_fn(
+                        self.compute_logits_leaves,
+                        hidden_states,
+                        lora_metadata,
+                    )
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
@@ -1869,6 +2302,224 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             padded_num_scheduled_tokens_per_dp_rank,
         )
         return None
+
+    def _record_cd_gate(self, case: str) -> None:
+        counts = self._cd_gate_counts
+        counts[case] += 1
+        total = counts["decode_only"] + counts["prefill_completes"] + counts[
+            "prefill_partial"]
+        # 5, not 100. continue_decode makes gated steps scarce -- at cd64 with
+        # max_num_seqs=16 one step retires ~1024 tokens, so a 128-prompt run
+        # gates only ~16 times and a 100-step interval never fires. The
+        # counters below then read as absent rather than as zero, which is
+        # indistinguishable from the feature being off and is exactly how the
+        # first attempt at this A/B passed for the wrong reason.
+        if total % 5 == 0:
+            logger.info(
+                "continue_decode gate over %d steps: decode_only=%.1f%% "
+                "prefill_completes=%.1f%% prefill_partial=%.1f%% | "
+                "chained=%d bailed=%d extra_tokens=%d", total,
+                100.0 * counts["decode_only"] / total,
+                100.0 * counts["prefill_completes"] / total,
+                100.0 * counts["prefill_partial"] / total, self._cd_chain_fired,
+                self._cd_chain_bailed, self._cd_chain_tokens)
+
+    def _will_be_decode_only(self, scheduler_output: "VllmSchedulerOutput"
+                             ) -> bool:
+        """True if every request will be decoding once this step completes.
+
+        A request qualifies when it is already decoding (1 scheduled token) or
+        when this step finishes its prompt -- i.e. no chunked prefill is left
+        in flight. That is exactly the condition under which the fused decode
+        loop can be entered straight after this step's forward, without going
+        back to the scheduler.
+        """
+        if scheduler_output.scheduled_spec_decode_tokens:
+            return False
+        num_reqs = self.input_batch.num_reqs
+        num_scheduled = scheduler_output.num_scheduled_tokens
+        computed = self.input_batch.num_computed_tokens_cpu
+        prompt_lens = self.input_batch.num_prompt_tokens
+        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            n = num_scheduled[req_id]
+            if n == 1:
+                continue
+            if computed[i] + n < prompt_lens[i]:
+                return False
+        return True
+
+    def _can_chain_continue_decode(self) -> bool:
+        """Whether this runner may chain the fused loop onto a mixed forward.
+
+        The chained path reuses the plain-decode program, so it is restricted
+        to the configurations that program already covers: no speculative
+        decoding (the loop samples one token per request), no multi-modal or
+        pooling runners, no prefill context parallelism, no routed-expert
+        collection, and no async scheduling (the async path threads a single
+        set of placeholders per step, which a two-dispatch step would
+        double-count).
+        """
+        return (envs.CONTINUE_DECODE_AFTER_PREFILL
+                and self.enable_continue_decode
+                and self.static_max_decode_steps > 1
+                and not self.scheduler_config.async_scheduling
+                and self.speculative_config is None
+                and not self.is_multimodal_model and not self.is_pooling_model
+                and not self.input_batch.num_prompt_logprobs
+                and self.vllm_config.sharding_config.prefill_cp_size <= 1
+                and not self.model_config.enable_return_routed_experts)
+
+    def _continue_decode_after_prefill(
+        self,
+        scheduler_output: "VllmSchedulerOutput",
+        output: ModelRunnerOutput,
+    ) -> ModelRunnerOutput:
+        """Chain the fused decode loop onto a step whose prefills completed.
+
+        `_execute_continue_decode` requires the batch to be decode-only
+        *before* the forward. This runs after a mixed forward instead: every
+        prompt is now in the KV cache and every request holds exactly one
+        freshly sampled token, so the batch is decode-only from here on and the
+        loop can be entered without another scheduler round trip. The tokens it
+        produces are appended to the ones the mixed step already sampled.
+        """
+        next_tokens = self._cd_chain_next_tokens
+        self._cd_chain_next_tokens = None
+        if next_tokens is None:
+            self._cd_chain_bailed += 1
+            return output
+
+        num_reqs = self.input_batch.num_reqs
+        req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
+
+        # patch_vllm_scheduler_for_continue_decode reserves
+        # num_scheduled + (static_max_decode_steps - 1) KV slots per request,
+        # and the forward just consumed num_scheduled, so at most
+        # static_max_decode_steps - 1 tokens may still be produced on device.
+        # num_tokens already counts the token the mixed step sampled.
+        max_decode_steps = min(self.static_max_decode_steps - 1,
+                               self._get_min_remaining_slots())
+        if max_decode_steps <= 0:
+            self._cd_chain_bailed += 1
+            return output
+
+        # Re-derive the metadata as the next scheduler step would see it:
+        # prompts fully computed, one token in flight per request. This is the
+        # host work of one plain decode step and it buys max_decode_steps of
+        # on-device decoding.
+        computed = self.input_batch.num_computed_tokens_cpu
+        saved_computed = computed[:num_reqs].copy()
+        saved_distribution = self.input_batch.request_distribution
+        for i, req_id in enumerate(req_ids):
+            computed[i] += scheduler_output.num_scheduled_tokens[req_id]
+        self.input_batch.request_distribution = [num_reqs, num_reqs, num_reqs]
+        decode_sched = copy.copy(scheduler_output)
+        decode_sched.num_scheduled_tokens = dict.fromkeys(req_ids, 1)
+        decode_sched.total_num_scheduled_tokens = num_reqs
+        decode_sched.scheduled_spec_decode_tokens = {}
+        try:
+            (input_ids, _, attn_metadata, sampling_metadata, logits_indices, _,
+             _, _, _, _, tokens_indices_selector,
+             _) = self._prepare_inputs(decode_sched)
+        finally:
+            computed[:num_reqs] = saved_computed
+            self.input_batch.request_distribution = saved_distribution
+
+        if sampling_metadata.logprobs:
+            # Merging the loop's per-step logprobs with the ones the mixed step
+            # already produced is not worth the complexity; fall back.
+            self._cd_chain_bailed += 1
+            return output
+
+        assert next_tokens.shape == input_ids.shape, (
+            f"sampled tokens {next_tokens.shape} do not match the decode "
+            f"input layout {input_ids.shape}")
+        active_mask = _compute_active_mask(logits_indices, self.dp_size,
+                                           input_ids.shape[0] // self.dp_size)
+        init_state = TpuSamplingState(
+            current_tokens=next_tokens,
+            active_mask=active_mask,
+            attn_metadata=attn_metadata,
+            step_counter=self.zero_array,
+        )
+
+        from tpu_inference.layers.jax.sample.sampling import sample
+
+        max_steps_arr = self._max_decode_steps_arrays.get(max_decode_steps)
+        if max_steps_arr is None:
+            max_steps_arr = jax.device_put(
+                np.array(max_decode_steps, dtype=np.int32),
+                self._scalar_sharding)
+            self._max_decode_steps_arrays[max_decode_steps] = max_steps_arr
+
+        # No kv-connector context here: the mixed forward already ran it for
+        # this step.
+        with self.maybe_forbid_compile, \
+             set_forward_context(None, self.vllm_config), \
+             self._phase("cd_loop"), self._enqueue_lock:
+            (generated_tokens, final_kv_caches, final_state, final_rng, _,
+             _) = continue_decode(
+                 state=self.state_leaves,
+                 model_fn=self.model.step_fn_no_options,
+                 compute_logits_fn=self.compute_logits_fn,
+                 sample_fn=sample,
+                 mesh=self.mesh,
+                 sampling_metadata=sampling_metadata,
+                 init_state=init_state,
+                 kv_caches=self.kv_caches,
+                 max_decode_steps=max_steps_arr,
+                 static_max_decode_steps=self.static_max_decode_steps,
+                 eos_token_id=self.eos_token_id,
+                 padding_token_id=self.pad_token_id,
+                 rng=self.rng_params_for_sampling,
+                 inputs_embeds=None,
+                 layer_name_to_kvcache_index=tuple(
+                     self.layer_name_to_kvcache_index.items()),
+                 lora_metadata=self.lora_utils.extract_lora_metadata(),
+                 intermediate_tensors=None,
+                 is_first_rank=self.is_first_rank,
+                 is_last_rank=self.is_last_rank,
+                 dp_size=self.dp_size,
+                 collect_expert_indices=False,
+                 max_logprobs=self.model_config.max_logprobs,
+                 logprobs_mode=self.model_config.logprobs_mode,
+                 continue_decode_eos_check_interval=self.
+                 continue_decode_eos_check_interval,
+             )
+
+        self.rng_params_for_sampling = final_rng
+        self.kv_caches = final_kv_caches
+
+        # scheduler_output is deliberately not passed: unlike
+        # `_execute_continue_decode` this step was scheduled normally, so
+        # num_scheduled_tokens must keep the value the scheduler assigned or
+        # its in-flight token accounting goes negative. The extra tokens reach
+        # the scheduler through the length of sampled_token_ids, which
+        # patch_vllm_scheduler_for_continue_decode already handles.
+        continued_token_ids, _, _, _, _ = _process_continue_decode_outputs(
+            generated_tokens=generated_tokens,
+            actual_steps=final_state.step_counter,
+            req_ids=req_ids,
+            eos_token_id=self.eos_token_id,
+            indices_selector=tokens_indices_selector,
+            requests=self.requests,
+            block_size=self.block_size,
+            input_batch=self.input_batch,
+            max_num_reqs=self.max_num_reqs,
+            max_model_len=self.max_model_len,
+            attn_metadata=attn_metadata,
+        )
+
+        # A request whose mixed-step token was already EOS keeps decoding here
+        # (its row stays active), but vLLM trims the returned list at the stop
+        # token, so the extra tokens are discarded rather than emitted.
+        sampled = output.sampled_token_ids
+        self._cd_chain_fired += 1
+        for i, extra in enumerate(continued_token_ids):
+            if extra and i < len(sampled) and sampled[i]:
+                sampled[i].extend(extra)
+                self._cd_chain_tokens += len(extra)
+        return output
 
     def _get_min_remaining_slots(self) -> int:
         # Conservatively calculate the minimum remaining token capacity based on max_model_len.
@@ -1898,7 +2549,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             padded_num_scheduled_tokens_per_dp_rank,
             tokens_indices_selector,
             _,
-        ) = self._prepare_inputs(scheduler_output)
+        ) = self._prepare_inputs_timed(scheduler_output)
 
         init_tokens = input_ids
         # Map active rows correctly across DP buckets by checking valid query locations.
@@ -1922,7 +2573,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         max_decode_steps = min(self.static_max_decode_steps, min_remaining)
         if max_decode_steps <= 0:
             max_decode_steps = 1
-        max_decode_steps_arr = jnp.array(max_decode_steps, dtype=jnp.int32)
+        max_decode_steps_arr = self._max_decode_steps_arrays.get(
+            max_decode_steps)
+        if max_decode_steps_arr is None:
+            max_decode_steps_arr = jax.device_put(
+                np.array(max_decode_steps, dtype=np.int32),
+                self._scalar_sharding)
+            self._max_decode_steps_arrays[
+                max_decode_steps] = max_decode_steps_arr
 
         lora_metadata = self.lora_utils.extract_lora_metadata()
 
@@ -1935,7 +2593,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         with self.maybe_forbid_compile, \
              set_forward_context(None, self.vllm_config), \
              self.maybe_get_kv_connector_output(
-                 scheduler_output) as kv_connector_output:
+                 scheduler_output) as kv_connector_output, \
+             self._phase("cd_loop"), self._enqueue_lock:
             (generated_tokens, final_kv_caches, final_state, final_rng,
              all_expert_indices, logprobs_tensors) = continue_decode(
                  state=self.state_leaves,
@@ -1972,11 +2631,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             self.rng_params_for_sampling = final_rng
             self.kv_caches = final_kv_caches
 
-            last_step_idx = jnp.clip(final_state.step_counter - 1, 0,
-                                     self.static_max_decode_steps - 1)
-            next_tokens_in_tpu = generated_tokens[
-                last_step_idx,
-                jnp.arange(generated_tokens.shape[1])]
+            next_tokens_in_tpu = _pick_last_step_tokens(
+                self.static_max_decode_steps)(generated_tokens,
+                                              final_state.step_counter)
 
             generated_tokens_async = jax.copy_to_host_async(generated_tokens)
             actual_steps_async = jax.copy_to_host_async(
@@ -2125,64 +2782,83 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             padded_num_reqs = runner_utils.get_padded_num_reqs_with_upper_limit(
                 self.input_batch.num_reqs, self.max_num_reqs)
 
-        if tpu_sampling_metadata.do_sampling:
-            self.rng_params_for_sampling, step_rng = jax.random.split(
-                self.rng_params_for_sampling)
+        if getattr(self, "_prefused_sample", None) is not None:
+            next_tokens, processed_logits = self._prefused_sample
+            self._prefused_sample = None
+            processed_bonus_logits = None
         else:
-            step_rng = self.rng_params_for_sampling
+            if tpu_sampling_metadata.do_sampling:
+                self.rng_params_for_sampling, step_rng = jax.random.split(
+                    self.rng_params_for_sampling)
+            else:
+                step_rng = self.rng_params_for_sampling
 
-        processed_bonus_logits = None
-        allow_distributed_sampling = distributed_sampling_allowed(
-            tpu_sampling_metadata.logprobs, self.model_config.logprobs_mode)
-        if spec_decode_metadata is None:
-            logits = logits.astype(jnp.float32)
-            with self.maybe_forbid_compile:
-                next_tokens, processed_logits = sample(
-                    step_rng,
+            processed_bonus_logits = None
+            allow_distributed_sampling = distributed_sampling_allowed(
+                tpu_sampling_metadata.logprobs,
+                self.model_config.logprobs_mode)
+            if spec_decode_metadata is None:
+                # No astype here: `sample` casts to float32 itself, right after the
+                # argmax, and bf16 -> f32 is exact so the greedy result is
+                # unchanged. Casting outside costs an eager dispatch (3% of all
+                # GIL-held time under mesh DP) and materialises a full
+                # [batch, vocab] f32 tensor that XLA otherwise fuses away.
+                with self.maybe_forbid_compile, self._phase("sample"), \
+                        self._enqueue_lock:
+                    next_tokens, processed_logits = sample(
+                        step_rng,
+                        self.mesh,
+                        logits,
+                        tpu_sampling_metadata,
+                        allow_distributed_sampling=allow_distributed_sampling,
+                    )
+            else:
+                if tpu_sampling_metadata.do_sampling:
+                    bonus_rng, rejection_rng = jax.random.split(step_rng)
+                else:
+                    bonus_rng = step_rng
+                    rejection_rng = step_rng
+                bonus_logits = self._select_from_array_fn(
+                    logits, spec_decode_metadata.bonus_logits_indices,
                     self.mesh,
-                    logits,
+                    self.vllm_config.sharding_config.prefill_cp_size)
+                bonus_token_ids, processed_bonus_logits = sample(
+                    bonus_rng,
+                    self.mesh,
+                    bonus_logits,
                     tpu_sampling_metadata,
                     allow_distributed_sampling=allow_distributed_sampling,
                 )
-        else:
-            if tpu_sampling_metadata.do_sampling:
-                bonus_rng, rejection_rng = jax.random.split(step_rng)
-            else:
-                bonus_rng = step_rng
-                rejection_rng = step_rng
-            bonus_logits = self._select_from_array_fn(
-                logits, spec_decode_metadata.bonus_logits_indices, self.mesh,
-                self.vllm_config.sharding_config.prefill_cp_size)
-            bonus_token_ids, processed_bonus_logits = sample(
-                bonus_rng,
-                self.mesh,
-                bonus_logits,
-                tpu_sampling_metadata,
-                allow_distributed_sampling=allow_distributed_sampling,
-            )
-            target_logits = self._select_from_array_fn(
-                logits, spec_decode_metadata.target_logits_indices, self.mesh,
-                self.vllm_config.sharding_config.prefill_cp_size)
-            assert input_ids is not None
-            draft_token_ids = self._extract_draft_token_ids(
-                input_ids, spec_decode_metadata.final_logits_indices,
-                spec_decode_metadata.target_logits_indices)
-            next_tokens = self.rejection_sampler(
-                draft_token_ids=draft_token_ids,
-                num_draft_tokens=spec_decode_metadata.draft_lengths,
-                draft_probs=None,
-                target_logits=target_logits,
-                bonus_token_ids=bonus_token_ids,
-                sampling_metadata=tpu_sampling_metadata,
-                key=rejection_rng,
-            )
+                target_logits = self._select_from_array_fn(
+                    logits, spec_decode_metadata.target_logits_indices,
+                    self.mesh,
+                    self.vllm_config.sharding_config.prefill_cp_size)
+                assert input_ids is not None
+                draft_token_ids = self._extract_draft_token_ids(
+                    input_ids, spec_decode_metadata.final_logits_indices,
+                    spec_decode_metadata.target_logits_indices)
+                next_tokens = self.rejection_sampler(
+                    draft_token_ids=draft_token_ids,
+                    num_draft_tokens=spec_decode_metadata.draft_lengths,
+                    draft_probs=None,
+                    target_logits=target_logits,
+                    bonus_token_ids=bonus_token_ids,
+                    sampling_metadata=tpu_sampling_metadata,
+                    key=rejection_rng,
+                )
 
-        logits = logits.astype(jnp.float32)
+        if self._cd_chain_pending:
+            # Seed for the fused loop chained on after this step. Kept on
+            # device: the loop consumes it directly, so nothing here forces a
+            # host sync.
+            self._cd_chain_next_tokens = next_tokens
+
         if full_logits is not None:
             full_logits = full_logits.astype(jnp.float32)
         # Provide mesh context for out_shardings=P() on logprobs jits.
         with self.maybe_forbid_compile, jax.set_mesh(self.mesh):
             if tpu_sampling_metadata.logprobs:
+                logits = logits.astype(jnp.float32)
                 if spec_decode_metadata is not None:
                     if (self.model_config.logprobs_mode == "processed_logprobs"
                             and tpu_sampling_metadata.do_sampling):
@@ -2348,9 +3024,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 runner=self)
             return async_model_runner_output
 
-        valid_sampled_token_ids = runner_utils.host_extract_sampled_tokens(
-            self, spec_decode_metadata, next_tokens, logits_indices_selector,
-            discard_sampled_tokens_req_indices, num_reqs)
+        with self._phase("d2h"):
+            valid_sampled_token_ids = runner_utils.host_extract_sampled_tokens(
+                self, spec_decode_metadata, next_tokens,
+                logits_indices_selector, discard_sampled_tokens_req_indices,
+                num_reqs)
 
         # Append sampled tokens
         for req_idx, req_state, _ in request_seq_lens:
@@ -2711,9 +3389,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         idx_pad_len = len(input) - len(token_in_tpu_cur_input_indices)
 
         # Pad according to the instructions written inside self._substitute_placeholder_token_fn
-        full_range = np.arange(0, len(input), dtype=np.int32)
-        missing_values = np.setdiff1d(full_range,
-                                      token_in_tpu_cur_input_indices)
+        # np.setdiff1d sorts and uniques both operands. These are already
+        # in-range indices into `input`, so a boolean mask yields the identical
+        # ascending result in O(n) instead. Profiling put setdiff1d/_unique1d at
+        # ~4% of on-CPU rank-thread time, paid once per rank per step.
+        mask = np.ones(len(input), dtype=bool)
+        mask[token_in_tpu_cur_input_indices] = False
+        missing_values = np.flatnonzero(mask).astype(np.int32)
         padded_token_in_tpu_cur_input_indices = np.concatenate(
             (token_in_tpu_cur_input_indices, missing_values))
 
@@ -2810,6 +3492,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         metadata_attn_sharding = NamedSharding(
             self.mesh, PartitionSpec(ShardingAxisName.BATCH))
 
+        self._split_begin()
         (req_ids_dp, req_indices_dp, num_scheduled_tokens_per_dp_rank,
          scheduled_tokens_per_dp_rank, num_req_per_dp_rank,
          padded_num_scheduled_tokens_per_dp_rank, padded_num_reqs,
@@ -2817,6 +3500,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
          padded_num_reqs_per_dp_rank, logits_indices_selector,
          tokens_indices_selector, max_num_reqs_per_dp_rank
          ) = self._prepare_input_metadata(scheduler_output)
+        self._split("p_meta")
         # Multi-modal support
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -2877,102 +3561,133 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         logits_indices_view = self.device_buffer.get_view(logits_indices_shape,
                                                           key="logits_indices")
 
-        # Populates input_ids and positions
-        for dp_rank in range(dp_size):
-            if num_req_per_dp_rank[dp_rank] == 0:
-                continue
-            token_offset = padded_num_scheduled_tokens_per_dp_rank * dp_rank
-            num_scheduled_tokens_per_req = scheduled_tokens_per_dp_rank[
-                dp_rank]
-            total_num_scheduled_tokens = num_scheduled_tokens_per_dp_rank[
-                dp_rank]
-            input_ids_cpu = input_ids_view[
-                token_offset:token_offset +
-                padded_num_scheduled_tokens_per_dp_rank]
-            positions_cpu = self.positions_cpu[
-                token_offset:token_offset +
-                padded_num_scheduled_tokens_per_dp_rank]
-            # Get request indices.
-            # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
-            # For each scheduled token, what are the corresponding req index.
-            req_indices = np.repeat(req_indices_dp[dp_rank],
-                                    num_scheduled_tokens_per_req)
-            # Get batched arange.
-            # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-            # For each scheduled token, what is its position in corresponding req.
-            arange = np.concatenate(
-                [self.arange_cpu[:n] for n in num_scheduled_tokens_per_req])
-            # Get positions.
-            positions_np = positions_cpu[:total_num_scheduled_tokens]
-            np.add(
-                self.input_batch.num_computed_tokens_cpu[req_indices],
-                arange,
-                out=positions_np,
-            )
-            # Get token indices.
-            # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-            # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
-            # where M is the max_model_len.
+        # Populates input_ids, positions, query_start_loc, seq_lens, and logits_indices
+        if (dp_size == 1 and num_req_per_dp_rank[0] > 0
+                and num_scheduled_tokens_per_dp_rank[0]
+                == num_req_per_dp_rank[0] and not self.speculative_config):
+            _num_reqs = num_req_per_dp_rank[0]
+            total_num_scheduled_tokens = _num_reqs
+            positions_np = self.positions_cpu[:_num_reqs]
+            positions_np[:] = self.input_batch.num_computed_tokens_cpu[:_num_reqs]
+            row_idx = self.arange_cpu[:_num_reqs]
             token_indices = (
                 positions_np +
-                req_indices * self.input_batch.token_ids_cpu.shape[1])
+                row_idx * self.input_batch.token_ids_cpu.shape[1])
             np.take(
                 self.input_batch.token_ids_cpu.ravel(),
                 token_indices,
-                out=input_ids_cpu[:total_num_scheduled_tokens],
+                out=input_ids_view[:_num_reqs],
             )
+            input_ids_view[_num_reqs:
+                           padded_num_scheduled_tokens_per_dp_rank] = 0
+            self._split("p_tokens")
 
-            input_ids_cpu[total_num_scheduled_tokens:] = 0
+            query_start_loc_view[:_num_reqs + 1] = self.arange_cpu[:_num_reqs +
+                                                                   1]
+            query_start_loc_view[_num_reqs + 1:] = _num_reqs
+            seq_lens_view[:_num_reqs] = positions_np + 1
+            seq_lens_view[_num_reqs:] = 0
+            logits_indices_view[:_num_reqs] = row_idx
+            logits_indices_view[_num_reqs:] = -1
+            self._split("p_attn")
+        else:
+            for dp_rank in range(dp_size):
+                if num_req_per_dp_rank[dp_rank] == 0:
+                    continue
+                token_offset = padded_num_scheduled_tokens_per_dp_rank * dp_rank
+                num_scheduled_tokens_per_req = scheduled_tokens_per_dp_rank[
+                    dp_rank]
+                total_num_scheduled_tokens = num_scheduled_tokens_per_dp_rank[
+                    dp_rank]
+                input_ids_cpu = input_ids_view[
+                    token_offset:token_offset +
+                    padded_num_scheduled_tokens_per_dp_rank]
+                positions_cpu = self.positions_cpu[
+                    token_offset:token_offset +
+                    padded_num_scheduled_tokens_per_dp_rank]
+                # Get request indices.
+                # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
+                # For each scheduled token, what are the corresponding req index.
+                req_indices = np.repeat(req_indices_dp[dp_rank],
+                                        num_scheduled_tokens_per_req)
+                # Get batched arange.
+                # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+                # For each scheduled token, what is its position in corresponding req.
+                arange = np.concatenate(
+                    [self.arange_cpu[:n] for n in num_scheduled_tokens_per_req])
+                # Get positions.
+                positions_np = positions_cpu[:total_num_scheduled_tokens]
+                np.add(
+                    self.input_batch.num_computed_tokens_cpu[req_indices],
+                    arange,
+                    out=positions_np,
+                )
+                # Get token indices.
+                # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+                # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
+                # where M is the max_model_len.
+                token_indices = (
+                    positions_np +
+                    req_indices * self.input_batch.token_ids_cpu.shape[1])
+                np.take(
+                    self.input_batch.token_ids_cpu.ravel(),
+                    token_indices,
+                    out=input_ids_cpu[:total_num_scheduled_tokens],
+                )
 
-        # Prepare the attention metadata (query_start_loc_cpu, seq_lens_cpu)
-        for dp_rank in range(dp_size):
-            req_offset = dp_rank * max_num_reqs_per_dp_rank
-            query_start_loc_cpu = query_start_loc_view[
-                req_offset + dp_rank:req_offset + max_num_reqs_per_dp_rank +
-                dp_rank + 1]
-            seq_lens_cpu = seq_lens_view[req_offset:req_offset +
-                                         max_num_reqs_per_dp_rank]
-            _num_reqs = num_req_per_dp_rank[dp_rank]
-            req_indices = req_indices_dp[dp_rank]
-            num_scheduled_tokens_per_req = scheduled_tokens_per_dp_rank[
-                dp_rank]
+                input_ids_cpu[total_num_scheduled_tokens:] = 0
+            self._split("p_tokens")
 
-            if _num_reqs == 0:
-                query_start_loc_cpu[:] = 0
-                seq_lens_cpu[:] = 0
-                continue
+            # Prepare the attention metadata (query_start_loc_cpu, seq_lens_cpu)
+            for dp_rank in range(dp_size):
+                req_offset = dp_rank * max_num_reqs_per_dp_rank
+                query_start_loc_cpu = query_start_loc_view[
+                    req_offset + dp_rank:req_offset +
+                    max_num_reqs_per_dp_rank + dp_rank + 1]
+                seq_lens_cpu = seq_lens_view[req_offset:req_offset +
+                                             max_num_reqs_per_dp_rank]
+                _num_reqs = num_req_per_dp_rank[dp_rank]
+                req_indices = req_indices_dp[dp_rank]
+                num_scheduled_tokens_per_req = scheduled_tokens_per_dp_rank[
+                    dp_rank]
 
-            # After buffer.reset(), the buffer is still dirty, so we need to zero
-            # Out the starting index.
-            query_start_loc_cpu[0] = 0
-            np.cumsum(
-                num_scheduled_tokens_per_req,
-                out=query_start_loc_cpu[1:_num_reqs + 1],
-            )
-            query_start_loc_cpu[_num_reqs +
-                                1:] = query_start_loc_cpu[_num_reqs]
+                if _num_reqs == 0:
+                    query_start_loc_cpu[:] = 0
+                    seq_lens_cpu[:] = 0
+                    continue
 
-            seq_lens_cpu[:_num_reqs] = (
-                self.input_batch.num_computed_tokens_cpu[req_indices] +
-                num_scheduled_tokens_per_req)
-            seq_lens_cpu[_num_reqs:] = 0
+                # After buffer.reset(), the buffer is still dirty, so we need to zero
+                # Out the starting index.
+                query_start_loc_cpu[0] = 0
+                np.cumsum(
+                    num_scheduled_tokens_per_req,
+                    out=query_start_loc_cpu[1:_num_reqs + 1],
+                )
+                query_start_loc_cpu[_num_reqs +
+                                    1:] = query_start_loc_cpu[_num_reqs]
 
-        # populate logits_indices
-        for dp_rank in range(dp_size):
-            req_offset = dp_rank * padded_num_reqs_per_dp_rank
-            query_loc_req_offset = dp_rank * (max_num_reqs_per_dp_rank + 1)
-            _num_reqs = num_req_per_dp_rank[dp_rank]
+                seq_lens_cpu[:_num_reqs] = (
+                    self.input_batch.num_computed_tokens_cpu[req_indices] +
+                    num_scheduled_tokens_per_req)
+                seq_lens_cpu[_num_reqs:] = 0
 
-            logits_indices_cpu = logits_indices_view[
-                req_offset:req_offset + padded_num_reqs_per_dp_rank]
-            logits_indices_cpu[:_num_reqs] = (
-                query_start_loc_view[query_loc_req_offset +
-                                     1:query_loc_req_offset + _num_reqs + 1] -
-                1)
-            logits_indices_cpu[_num_reqs:] = -1
+            # populate logits_indices
+            for dp_rank in range(dp_size):
+                req_offset = dp_rank * padded_num_reqs_per_dp_rank
+                query_loc_req_offset = dp_rank * (max_num_reqs_per_dp_rank + 1)
+                _num_reqs = num_req_per_dp_rank[dp_rank]
 
-            # Calculate batch composition statistics for active hardware profilers
-            # and/or continuous batch logging.
+                logits_indices_cpu = logits_indices_view[
+                    req_offset:req_offset + padded_num_reqs_per_dp_rank]
+                logits_indices_cpu[:_num_reqs] = (
+                    query_start_loc_view[query_loc_req_offset +
+                                         1:query_loc_req_offset + _num_reqs +
+                                         1] - 1)
+                logits_indices_cpu[_num_reqs:] = -1
+            self._split("p_attn")
+
+        # Calculate batch composition statistics for active hardware profilers
+        # and/or continuous batch logging.
         if self.phase_based_profiler or self.aggregated_stats_logger:
             self.batch_counter += 1
             batch_composition_stats = runner_utils.get_batch_composition_stats(
@@ -3004,6 +3719,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 [num_decode_in_dp_rank, num_decode_in_dp_rank, _num_reqs])
         request_distribution = np.array(_request_distribution,
                                         dtype=np.int32).ravel()
+        self._split("p_dist")
 
         # Prefill context parallelism (prefill-only batches): zigzag-chunk
         # each request independently and lay the tokens out in rank order.
@@ -3152,8 +3868,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             sharding=data_parallel_attn_sharding,
             req_indices_dp=req_indices_dp,
         )
+        self._split("p_sampling")
 
-        if self.uses_mrope:
+        # See `_fuse_h2d_metadata`: when eligible, `positions` and
+        # `request_distribution` ride along in the metadata blob rather than
+        # costing a `device_put` leaf each.
+        fuse_h2d = self._fuse_h2d_metadata
+        positions_cpu_fused = None
+        if fuse_h2d:
+            positions_cpu_fused = positions
+        elif self.uses_mrope:
             # M-RoPE positions are of the shape (3, max_num_tokens).
             # https://github.com/vllm-project/tpu-inference/blob/efc9608acd925bb3b64db6fda509514f799ab7be/tpu_inference/runner/tpu_runner.py#L555
             # Shard the positions accordingly.
@@ -3166,6 +3890,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             positions = device_array(self.mesh,
                                      positions,
                                      sharding=data_parallel_attn_sharding)
+        self._split("p_positions")
 
         # Collect block tables host arrays loops zone presence zones legality
         def build_block_table_host(kv_cache_gid: int) -> None:
@@ -3176,22 +3901,27 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                  block_table_obj.max_num_blocks_per_req),
                 key=f"block_tables_gid_{kv_cache_gid}")
 
-            # Zero out the view once for correct padding
-            block_tables_view.fill(0)
-
             cpu_tensor = block_table_obj.get_cpu_tensor()
-            for dp_rank in range(dp_size):
-                _num_reqs = num_req_per_dp_rank[dp_rank]
-                if _num_reqs == 0:
-                    continue
+            if dp_size == 1:
+                _num_reqs = num_req_per_dp_rank[0]
+                if _num_reqs > 0:
+                    block_tables_view[:_num_reqs] = cpu_tensor[:_num_reqs]
+                block_tables_view[_num_reqs:].fill(0)
+            else:
+                # Zero out the view once for correct padding
+                block_tables_view.fill(0)
+                for dp_rank in range(dp_size):
+                    _num_reqs = num_req_per_dp_rank[dp_rank]
+                    if _num_reqs == 0:
+                        continue
 
-                req_offset = dp_rank * max_num_reqs_per_dp_rank
-                # Use np.take with out= to avoid intermediate copies from advanced indexing
-                np.take(cpu_tensor,
-                        req_indices_dp[dp_rank],
-                        axis=0,
-                        out=block_tables_view[req_offset:req_offset +
-                                              _num_reqs])
+                    req_offset = dp_rank * max_num_reqs_per_dp_rank
+                    # Use np.take with out= to avoid intermediate copies from advanced indexing
+                    np.take(cpu_tensor,
+                            req_indices_dp[dp_rank],
+                            axis=0,
+                            out=block_tables_view[req_offset:req_offset +
+                                                  _num_reqs])
 
             if pcp_size > 1:
                 # Each request is two fused seqs (head, tail) and the kernel
@@ -3210,8 +3940,27 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             for gid, kv_cache_group in enumerate(
                     self.kv_cache_config.kv_cache_groups):
                 build_block_table_host(gid)
+        self._split("p_blocks")
+
+        unpack_shardings = None
+        if fuse_h2d:
+            self.device_buffer.append(positions_cpu_fused, key="positions")
+            self.device_buffer.append(request_distribution,
+                                      key="request_distribution")
 
         metadata_blob, metadata_layout = self.device_buffer.build()
+
+        if fuse_h2d:
+            # Everything in the blob keeps the blob's own sharding except
+            # `positions`, which the backbone was precompiled against as
+            # P(ATTN_DATA); pin it back inside the unpack jit using the
+            # mesh-independent PartitionSpec so all rank threads share the
+            # same static cache key.
+            attn_spec = PartitionSpec(ShardingAxisName.ATTN_DATA)
+            unpack_shardings = tuple(
+                attn_spec if k == "positions" else None
+                for k in metadata_layout.keys)
+        self._split("p_build")
 
         # Mamba slot ids are only consumed by hybrid attn+mamba models; for
         # pure-attention models, leaving the field None keeps AttentionMetadata
@@ -3237,19 +3986,34 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 mamba_state_indices_cpu[req_offset:req_offset +
                                         _num_reqs] = (global_slots %
                                                       local_slots)
-            (request_distribution, mamba_state_indices,
-             dev_arrays_payload) = device_array(
-                 self.mesh, (request_distribution, mamba_state_indices_cpu,
-                             metadata_blob),
-                 sharding=metadata_attn_sharding)
+            with self._phase("h2d"), self._enqueue_lock:
+                (request_distribution, mamba_state_indices,
+                 dev_arrays_payload) = device_array(
+                     self.mesh,
+                     (request_distribution, mamba_state_indices_cpu,
+                      metadata_blob),
+                     sharding=metadata_attn_sharding)
+        elif fuse_h2d:
+            mamba_state_indices = None
+            with self._phase("h2d"), self._enqueue_lock:
+                dev_arrays_payload = device_array(
+                    self.mesh, metadata_blob, sharding=metadata_attn_sharding)
         else:
             mamba_state_indices = None
-            (request_distribution, dev_arrays_payload) = device_array(
-                self.mesh, (request_distribution, metadata_blob),
-                sharding=metadata_attn_sharding)
+            with self._phase("h2d"):
+                (request_distribution, dev_arrays_payload) = device_array(
+                    self.mesh, (request_distribution, metadata_blob),
+                    sharding=metadata_attn_sharding)
 
-        metadata = common_utils.DeviceBuffer.unpack_arrays(
-            dev_arrays_payload, metadata_layout)
+        with self._phase("unpack"), self._enqueue_lock:
+            metadata = common_utils.DeviceBuffer.unpack_arrays(
+                dev_arrays_payload, metadata_layout, unpack_shardings)
+        if fuse_h2d:
+            positions = metadata["positions"]
+            request_distribution = metadata["request_distribution"]
+        # `h2d` and `unpack` are `_phase`s, so restart the split clock past them
+        # rather than letting the next segment swallow (and double-deduct) them.
+        self._split_begin()
         input_ids = metadata["input_ids"]
         query_start_loc = metadata["query_start_loc"]
         seq_lens = metadata["seq_lens"]
@@ -3261,6 +4025,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if self.speculative_config and self.scheduler_config.async_scheduling and self._pre_async_results is not None:
             seq_lens, positions = self._subtract_num_rejected_tokens(
                 seq_lens, positions, req_ids_dp, scheduled_tokens_per_dp_rank)
+
+        self._split("p_unpackpost")
 
         def build_attn(block_tables: jax.Array | None) -> AttentionMetadata:
             attention_metadata_gid = AttentionMetadata(
@@ -3308,6 +4074,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     for group in self.kv_cache_config.kv_cache_groups),
             )
             shared_attention_metadata = build_shared_attn()
+        self._split("p_attnmeta")
+        # Back-to-back with the line above, so this must read ~0. It exists
+        # because `p_async` -- which covers nothing but the `if` below, and
+        # that `if` is false with async scheduling off -- reports 505us of CPU
+        # per step at dp=1 with no contention to blame. Something is being
+        # charged to this stretch that the stretch cannot be doing. Bracketing
+        # it says whether the time lands on the statement or on the timer, and
+        # only one of those is a real cost.
+        self._split("p_a0")
 
         # Async scheduling: substitute placeholder tokens for DP
         if self.scheduler_config.async_scheduling and self._pre_async_results is not None:
@@ -3337,16 +4112,22 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 input_ids, next_tokens, token_in_tpu_cur_input_indices,
                 token_in_tpu_pre_next_tokens_indices)
 
-        num_scheduled_tokens_per_req = np.concatenate([
-            np.array(scheduled_tokens_per_dp_rank[dp_rank], dtype=np.int32)
-            for dp_rank in range(dp_size)
-        ])
+        self._split("p_asyncif")
+        self._split("p_async")
+
         if self.lora_config is not None:
+            # Built inside the branch: `set_active_loras` is its only consumer,
+            # so with LoRA disabled this concatenate was pure per-step waste.
+            num_scheduled_tokens_per_req = np.concatenate([
+                np.array(scheduled_tokens_per_dp_rank[dp_rank], dtype=np.int32)
+                for dp_rank in range(dp_size)
+            ])
             self.lora_utils.set_active_loras(
                 num_scheduled_tokens_per_req,
                 total_num_scheduled_tokens,
                 padded_total_num_scheduled_tokens,
             )
+        self._split("p_tail")
 
         return (
             input_ids,

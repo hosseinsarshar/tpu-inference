@@ -31,6 +31,32 @@ DEFAULT_SAMPLING_PARAMS = dict(
 )
 
 
+@functools.lru_cache(maxsize=32)
+def _cached_collision_dummy(mesh: Mesh, size: int) -> jax.Array:
+    """The compile-cache discriminator array, built once per (mesh, size).
+
+    Its *shape* is the only thing that matters: it gives each logprobs config a
+    distinct compile-cache key. The contents are never read, so the array is a
+    constant and rebuilding plus re-transferring it every step is pure waste --
+    one device_put per rank per step, which mesh-based DP multiplies by dp_size.
+
+    Keyed on the mesh (hashable, and one per rank under mesh-based DP) so each
+    rank keeps the dummy on its own devices.
+    """
+    return device_array(
+        mesh,
+        np.zeros((size, ), dtype=np.int32),
+        # Use replicated sharding for dummy tensor.
+        sharding=jax.sharding.NamedSharding(mesh,
+                                            jax.sharding.PartitionSpec()))
+
+
+# Per-mesh cache of (padded_num_reqs, num_reqs, needs_logprobs, temp_np, top_k_np, top_p_np, metadata)
+# so decode steps whose active requests have unchanged sampling parameters skip
+# rebuilding and re-transferring 3 device arrays (and 6 GIL handoffs) per step.
+_SAMPLING_META_CACHE: dict = {}
+
+
 @functools.partial(
     jax.tree_util.register_dataclass,
     data_fields=[
@@ -63,19 +89,29 @@ class TPUSupportedSamplingMetadata:
 
         # Use a dummy tensor with a unique shape for each logprobs config.
         # This avoids persistent cache collisions.
-        dummy_shape = (1 if needs_logprobs else 2, )
-        cache_collision_dummy = np.zeros(dummy_shape, dtype=np.int32)
-        # Use replicated sharding for dummy tensor.
-        cache_collision_dummy = device_array(
-            mesh,
-            cache_collision_dummy,
-            sharding=jax.sharding.NamedSharding(mesh,
-                                                jax.sharding.PartitionSpec()))
+        cache_collision_dummy = _cached_collision_dummy(
+            mesh, 1 if needs_logprobs else 2)
 
         if input_batch.all_greedy:
             return cls(do_sampling=False,
                        logprobs=needs_logprobs,
                        _cache_collision_dummy=cache_collision_dummy)
+
+        dp_size = len(req_indices_dp)
+        if dp_size == 1:
+            req_indices = req_indices_dp.get(0, ())
+            n = len(req_indices)
+            temp_cur = input_batch.temperature_cpu[:n]
+            top_k_cur = input_batch.top_k_cpu[:n]
+            top_p_cur = input_batch.top_p_cpu[:n]
+            cached = _SAMPLING_META_CACHE.get(mesh)
+            if (cached is not None and cached[0] == padded_num_reqs
+                    and cached[1] == n and cached[2] == needs_logprobs
+                    and cached[3] == sharding
+                    and np.array_equal(temp_cur, cached[4])
+                    and np.array_equal(top_k_cur, cached[5])
+                    and np.array_equal(top_p_cur, cached[6])):
+                return cached[7]
 
         def fill_slice(cpu_tensor_np: np.ndarray,
                        fill_val: float) -> np.ndarray:
@@ -83,7 +119,6 @@ class TPUSupportedSamplingMetadata:
                                  fill_val,
                                  dtype=cpu_tensor_np.dtype)
 
-            dp_size = len(req_indices_dp)
             assert padded_num_reqs % dp_size == 0, f"padded_num_reqs ({padded_num_reqs}) must be divisible by dp_size ({dp_size})"
             padded_num_reqs_per_dp_rank = padded_num_reqs // dp_size
             for dp_rank in range(dp_size):
@@ -102,18 +137,33 @@ class TPUSupportedSamplingMetadata:
         top_p_tensor = fill_slice(input_batch.top_p_cpu,
                                   DEFAULT_SAMPLING_PARAMS["top_p"])
 
-        # Slice persistent device tensors to a fixed pre-compiled padded shape.
-        return cls(
-            temperature=device_array(mesh,
-                                     temp_tensor[:padded_num_reqs],
-                                     sharding=sharding),
-            top_p=device_array(mesh,
-                               top_p_tensor[:padded_num_reqs],
-                               sharding=sharding),
-            top_k=device_array(mesh,
-                               top_k_tensor[:padded_num_reqs],
-                               sharding=sharding),
+        # Transfer all three sampling arrays in a single batched device_put
+        # instead of three separate device_put calls.
+        temperature_dev, top_p_dev, top_k_dev = device_array(
+            mesh,
+            (temp_tensor[:padded_num_reqs], top_p_tensor[:padded_num_reqs],
+             top_k_tensor[:padded_num_reqs]),
+            sharding=sharding,
+        )
+        result = cls(
+            temperature=temperature_dev,
+            top_p=top_p_dev,
+            top_k=top_k_dev,
             _cache_collision_dummy=cache_collision_dummy,
             do_sampling=not input_batch.all_greedy,
             logprobs=needs_logprobs,
         )
+        if dp_size == 1:
+            req_indices = req_indices_dp.get(0, ())
+            n = len(req_indices)
+            _SAMPLING_META_CACHE[mesh] = (
+                padded_num_reqs,
+                n,
+                needs_logprobs,
+                sharding,
+                input_batch.temperature_cpu[:n].copy(),
+                input_batch.top_k_cpu[:n].copy(),
+                input_batch.top_p_cpu[:n].copy(),
+                result,
+            )
+        return result

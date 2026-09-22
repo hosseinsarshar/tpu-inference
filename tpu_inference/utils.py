@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import functools
 import time
 from collections import defaultdict
 from collections.abc import Sequence
@@ -212,11 +213,32 @@ def pathways_hbm_usage_gb(devices: Any) -> List[Tuple[float, float]]:
     seen_buffers = set()
 
     for array in live_arrays:
-        for buffer in array.addressable_shards:
-            buffer_id = id(buffer.data)
-            if buffer_id not in seen_buffers:
-                seen_buffers.add(buffer_id)
-                hbm_used[buffer.data.device] += buffer.data.nbytes
+        # jax.live_arrays() is a snapshot. Under mesh-based DP the other rank
+        # threads are deleting their own arrays concurrently (one
+        # collective_rpc("delete_kv_cache") reaches every rank at once), so an
+        # entry can be gone by the time we reach it. A deleted array holds no
+        # HBM, so it contributes nothing and is skipped. Single-threaded SPMD
+        # never takes this branch.
+        #
+        # Catch Exception, not RuntimeError. Teardown is not atomic, so a
+        # half-deleted array has more than one way to fail. `addressable_shards`
+        # is `[Shard(...) for a in self._arrays]`, and `_arrays` is set to None
+        # on the way down -- iterating that raises TypeError, not RuntimeError,
+        # and the narrower guard let it through. Seen at dp16/tp1, where 16 rank
+        # threads widen the window enough to hit it every run.
+        try:
+            shards = array.addressable_shards
+        except Exception:  # noqa: BLE001
+            continue
+        for buffer in shards:
+            try:
+                data = buffer.data
+                buffer_id = id(data)
+                if buffer_id not in seen_buffers:
+                    seen_buffers.add(buffer_id)
+                    hbm_used[data.device] += data.nbytes
+            except Exception:  # noqa: BLE001
+                continue
 
     return [(hbm_used[device], hbm_limit) for device in devices]
 
@@ -542,11 +564,37 @@ class DeviceBuffer:
         self._sizes = []
 
     @staticmethod
-    def unpack_arrays(blob: jax.Array,
-                      metadata: DeviceBufferMetadata) -> Dict[str, jax.Array]:
+    @functools.partial(jax.jit, static_argnums=(1, 2))
+    def _split_blob(
+        blob: jax.Array,
+        metadata: DeviceBufferMetadata,
+        shardings: Optional[Tuple[Any, ...]] = None,
+    ) -> Tuple[jax.Array, ...]:
+        indices = tuple(np.cumsum(metadata.sizes)[:-1])
+        parts = tuple(jnp.split(blob, indices))
+        if shardings is None:
+            return parts
+        # A part shipped inside the blob inherits the blob's sharding, but the
+        # consumer's jit cache is keyed on the sharding it was precompiled
+        # with. Pinning each part back to its own spec keeps the downstream
+        # signature byte-identical to the unfused path.
+        return tuple(p if s is None else jax.lax.with_sharding_constraint(p, s)
+                     for p, s in zip(parts, shardings))
+
+    @staticmethod
+    def unpack_arrays(
+        blob: jax.Array,
+        metadata: DeviceBufferMetadata,
+        shardings: Optional[Tuple[Any, ...]] = None,
+    ) -> Dict[str, jax.Array]:
         """
         Unpack a 1D blob into a dictionary of arrays based on provided metadata.
+
+        `shardings`, if given, is one entry per key (None to leave a part
+        alone) and is applied inside the jit.
         """
-        indices = tuple(np.cumsum(metadata.sizes)[:-1])
-        parts = jnp.split(blob, indices)
-        return {key: parts[i] for i, key in enumerate(metadata.keys)}
+        # Under jit this is one dispatch; eagerly, `jnp.split` is one full
+        # primitive dispatch per part, and mesh DP pays that per rank per step
+        # behind a single GIL. The layout is static, so it is a free jit.
+        parts = DeviceBuffer._split_blob(blob, metadata, shardings)
+        return dict(zip(metadata.keys, parts))

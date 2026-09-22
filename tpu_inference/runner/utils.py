@@ -131,6 +131,56 @@ PHASED_PROFILER_TRACK_CONCURRENCY = False
 
 logger = init_logger(__name__)
 
+# The JAX profiler is process-wide, so only one runner per process may own it.
+# Under MPMD and SPMD that is automatic (one runner per process), but mesh DP
+# runs every DP rank as a thread of the same process and would otherwise have
+# rank 1 die on "profiler is already active".
+_PROFILER_CLAIM_LOCK = threading.Lock()
+_PROFILER_CLAIMED = False
+
+
+def claim_process_profiler() -> bool:
+    """True for the first caller in this process, False for every one after."""
+    global _PROFILER_CLAIMED
+    with _PROFILER_CLAIM_LOCK:
+        if _PROFILER_CLAIMED:
+            return False
+        _PROFILER_CLAIMED = True
+        return True
+
+
+# Serialises the model dispatch across the rank threads of one process. Shared
+# by every runner in the process, so it is module level rather than per-runner.
+#
+# Donating a buffer to a jit call releases the GIL, once per donated buffer, and
+# the model donates its KV cache one array per layer. Measured on v6e with 28
+# donated buffers and 8 threads: 59.7 voluntary context switches per dispatch,
+# against 1.0 for the same call on one thread. The releases themselves are
+# cheap; what costs is that a waiting thread takes the GIL at every one of them,
+# so the dispatching thread pays a ~190us sleep/wake round trip 59 times to get
+# it back. A release nobody is waiting on is free, which is why this is a
+# contention problem and not a donation problem.
+#
+# The ranks were not overlapping here anyway -- 8 threads deliver 1.27x the
+# dispatches of one -- so serialising costs almost no parallelism and removes
+# the ping-pong. Measured on the same benchmark: 3,597 -> 4,709 dispatches/s
+# (1.31x) with switches down to 4.07.
+#
+# Only the *enqueue* may be held. The dispatch returns futures and the device
+# work happens after it returns, so ranks still overlap on the device, which is
+# where the overlap has to be. Never hold this across a `block_until_ready`, a
+# `device_get`, or anything else that waits on a result.
+#
+# End to end on v6e-8 dp8/tp1 1024x1024, n=3 per arm: 14,267 -> 15,236 out tok/s
+# (+6.8%), and the run-to-run spread tightens from 5.3% to 1.9%. Widening it
+# past the model dispatch loses; see `MESH_DP_DISPATCH_LOCK` in `envs.py`.
+_DISPATCH_LOCK = threading.Lock()
+
+
+def dispatch_lock() -> threading.Lock:
+    """The process-wide model-dispatch lock. See `_DISPATCH_LOCK`."""
+    return _DISPATCH_LOCK
+
 
 class InferencePhase(Enum):
     PREFILL_HEAVY = 0
@@ -628,7 +678,8 @@ class PhasedBasedProfiler:
         }
         if envs.PROFILE_SINGLE_DEVICE:
             self.default_profiling_options.advanced_configuration = {
-                "tpu_num_chips_to_profile_per_task": 1,
+                "tpu_num_chips_to_profile_per_task":
+                (len(jax.devices()) if envs.TPU_MESH_BASED_DP else 1),
                 "tpu_num_sparse_cores_to_trace": 1,
                 "tpu_num_sparse_core_tiles_to_trace": 1,
             }

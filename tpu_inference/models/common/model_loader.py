@@ -367,9 +367,62 @@ def get_flax_model(
     # avoids the per-call `nnx.Variable` pytree traversal that otherwise
     # costs ~17 ms/step on Gemma-4-31B decode at TP=2.
     _state_treedef = jax.tree_util.tree_structure(state)
+    _raw_state_leaves = tuple(jax.tree_util.tree_leaves(state))
+    _leaf_groups: Dict[Any, List[int]] = {}
+    for _idx, _arr in enumerate(_raw_state_leaves):
+        if isinstance(_arr, jax.Array):
+            _gkey = (_arr.shape, _arr.dtype, _arr.sharding)
+            _leaf_groups.setdefault(_gkey, []).append(_idx)
+    _packed_leaves_list: List[Any] = []
+    _packed_is_stacked: List[bool] = []
+    _unpack_map: List[Tuple[int, Optional[int]]] = [(-1, None)] * len(
+        _raw_state_leaves)
+    for _gkey, _indices in _leaf_groups.items():
+        if len(_indices) >= 4:
+            _p_idx = len(_packed_leaves_list)
+            _stacked = jax.jit(lambda xs: jax.numpy.stack(xs, axis=0))(
+                [_raw_state_leaves[i] for i in _indices])
+            _packed_leaves_list.append(_stacked)
+            _packed_is_stacked.append(True)
+            for _s_idx, _orig_i in enumerate(_indices):
+                _unpack_map[_orig_i] = (_p_idx, _s_idx)
+        else:
+            for _orig_i in _indices:
+                _p_idx = len(_packed_leaves_list)
+                _packed_leaves_list.append(_raw_state_leaves[_orig_i])
+                _packed_is_stacked.append(False)
+                _unpack_map[_orig_i] = (_p_idx, None)
+    for _idx, _arr in enumerate(_raw_state_leaves):
+        if _unpack_map[_idx][0] == -1:
+            _p_idx = len(_packed_leaves_list)
+            _packed_leaves_list.append(_arr)
+            _packed_is_stacked.append(False)
+            _unpack_map[_idx] = (_p_idx, None)
+    _packed_state_leaves = tuple(_packed_leaves_list)
+    _packed_is_stacked_tuple = tuple(_packed_is_stacked)
+    _unpack_map_tuple = tuple(_unpack_map)
+    logger.info("Packed %d model weight leaves into %d stacked leaves",
+                len(_raw_state_leaves), len(_packed_state_leaves))
+
+    def _unpack_state_leaves(leaves):
+        if len(leaves) == len(_raw_state_leaves):
+            return leaves
+        unpacked_groups = [
+            [
+                jax.lax.index_in_dim(arr, j, axis=0, keepdims=False)
+                for j in range(arr.shape[0])
+            ] if is_stacked else arr
+            for arr, is_stacked in zip(leaves, _packed_is_stacked_tuple)
+        ]
+        return [
+            unpacked_groups[p_idx][s_idx]
+            if s_idx is not None else unpacked_groups[p_idx]
+            for p_idx, s_idx in _unpack_map_tuple
+        ]
 
     def run_model_impl(state_leaves, *args):
-        state = jax.tree_util.tree_unflatten(_state_treedef, state_leaves)
+        state = jax.tree_util.tree_unflatten(
+            _state_treedef, _unpack_state_leaves(state_leaves))
         model = nnx.merge(graphdef, state)
         return model(*args)
 
@@ -401,8 +454,17 @@ def get_flax_model(
     # supplies the options for the whole fused program. Mirrors the torchax
     # path in `models/vllm/vllm_model_wrapper.py`.
     _step_fns: Dict[Tuple[bool, Any], Any] = {}
+    _fast_step_fns: Dict[Tuple[bool, int, int], Any] = {}
 
     def _get_step_fn(kv_caches, with_options: bool):
+        if isinstance(kv_caches, list) and kv_caches and not isinstance(
+                kv_caches[0], jax.core.Tracer):
+            fast_key = (with_options, len(kv_caches), id(kv_caches[0].sharding))
+            fn = _fast_step_fns.get(fast_key)
+            if fn is not None:
+                return fn
+        else:
+            fast_key = None
         shardings = _kv_cache_out_shardings(kv_caches)
         key = (with_options, tuple(jax.tree.leaves(shardings)))
         fn = _step_fns.get(key)
@@ -412,6 +474,8 @@ def get_flax_model(
             } if with_options else {})
             fn = _wrap_with_jit(run_model_impl, shardings, **options)
             _step_fns[key] = fn
+        if fast_key is not None:
+            _fast_step_fns[fast_key] = fn
         return fn
 
     _draft_step_fns: Dict[Any, Any] = {}
@@ -436,7 +500,8 @@ def get_flax_model(
         return fn
 
     def run_draft_model_impl(state_leaves, *args):
-        state = jax.tree_util.tree_unflatten(_state_treedef, state_leaves)
+        state = jax.tree_util.tree_unflatten(
+            _state_treedef, _unpack_state_leaves(state_leaves))
         model = nnx.merge(graphdef, state)
         return model(*args)
 
@@ -444,9 +509,36 @@ def get_flax_model(
         mesh,
         PartitionSpec(ShardingAxisName.MLP_DATA, ShardingAxisName.MLP_TENSOR))
 
+    # Strip transformer layer array values from the state used by
+    # `run_compute_logits` so that `nnx.merge(graphdef, state)` still sees all
+    # 311 `nnx.Variable` nodes while `jax.tree_util.tree_leaves` only sees the
+    # 4 non-layer `jax.Array` leaves (`_head_leaves`).
+    def _null_variables(node):
+        if isinstance(node, nnx.Variable):
+            return node.replace(None)
+        if isinstance(node, (dict, nnx.State)):
+            return type(node)({k: _null_variables(v) for k, v in node.items()})
+        return node
+
+    def _strip_layers(node):
+        if isinstance(node, (dict, nnx.State)):
+            return type(node)({
+                k: (_null_variables(v) if k == "layers" else _strip_layers(v))
+                for k, v in node.items()
+            })
+        return node
+
+    _head_state = _strip_layers(state)
+    _head_treedef = jax.tree_util.tree_structure(_head_state)
+    _head_leaves = tuple(jax.tree_util.tree_leaves(_head_state))
+
     @jax.jit(out_shardings=(logits_sharding))
     def run_compute_logits(state_leaves, *args):
-        state = jax.tree_util.tree_unflatten(_state_treedef, state_leaves)
+        if len(state_leaves) == len(_head_leaves):
+            state = jax.tree_util.tree_unflatten(_head_treedef, state_leaves)
+        else:
+            state = jax.tree_util.tree_unflatten(
+                _state_treedef, _unpack_state_leaves(state_leaves))
         model = nnx.merge(graphdef, state)
         hidden_state, *_ = args
         return model.compute_logits(hidden_state)
@@ -454,7 +546,8 @@ def get_flax_model(
     # Multi-modal support only
     # This function calculates the image/video token's embeddings by VIT
     def run_embed_multimodal(state_leaves, modality=None, **kwargs):
-        state = jax.tree_util.tree_unflatten(_state_treedef, state_leaves)
+        state = jax.tree_util.tree_unflatten(
+            _state_treedef, _unpack_state_leaves(state_leaves))
         model = nnx.merge(graphdef, state)
         return model.embed_multimodal(**kwargs)
 
@@ -465,7 +558,8 @@ def get_flax_model(
                                input_ids,
                                mm_embeds,
                                is_multimodal=None):
-        state = jax.tree_util.tree_unflatten(_state_treedef, state_leaves)
+        state = jax.tree_util.tree_unflatten(
+            _state_treedef, _unpack_state_leaves(state_leaves))
         model = nnx.merge(graphdef, state)
         return model.embed_input_ids(input_ids,
                                      mm_embeds,
@@ -485,7 +579,8 @@ def get_flax_model(
     # For models that want to work with EAGLE-3 speculative decoding
     @jax.jit(out_shardings=(logits_sharding))
     def combine_hidden_states(state_leaves, hidden_states):
-        state = jax.tree_util.tree_unflatten(_state_treedef, state_leaves)
+        state = jax.tree_util.tree_unflatten(
+            _state_treedef, _unpack_state_leaves(state_leaves))
         model = nnx.merge(graphdef, state)
         return model.combine_hidden_states(hidden_states)
 
@@ -496,6 +591,18 @@ def get_flax_model(
     # runner passes pre-flattened `state_leaves` as the first positional arg.
     model_supports_spec_step = supports_kw(model_class.__call__,
                                            "spec_step_idx")
+
+    # NOTE: passing the parameter leaves as argument 0 is what makes mesh-based
+    # DP GIL-bound -- JAX revalidates every leaf's aval, sharding and layout on
+    # every dispatch while holding the GIL, and mesh DP pays that once per rank
+    # rather than once per step. Capturing the weights as closure constants
+    # instead does fix dispatch (131 -> 31 us/call, 12.4k -> 60.6k calls/s
+    # across 8 threads) but is not viable: XLA then serialises the weights into
+    # every executable, which made each persistent-cache entry 2.8 GB (148 GB
+    # over ~140 entries) and slowed compilation 3.5x (3.5s -> 12.3s per
+    # executable on a Qwen3-0.6B-shaped stack). An optimization_barrier on the
+    # captured arrays fixes lowering time but not compile time. Shortening the
+    # dispatch path has to happen below jax.jit, not by moving the weights.
 
     def _resolve_step_fn(kv_caches, with_options: bool):
         if is_draft_model:
@@ -586,13 +693,22 @@ def get_flax_model(
     else:
         pooler_fn = _not_support
 
-    state_leaves = tuple(jax.tree_util.tree_leaves(state))
+    state_leaves = (
+        _packed_state_leaves
+        if os.environ.get("ENABLE_WEIGHT_PACKING", "0") == "1"
+        else _raw_state_leaves
+    )
+    _id_to_leaf_idx = {id(x): i for i, x in enumerate(_raw_state_leaves)}
+    compute_logits_fn.head_leaf_indices = tuple(
+        _id_to_leaf_idx[id(x)] for x in _head_leaves if id(x) in _id_to_leaf_idx
+    )
 
     # `runner/tpu_runner.py` and `runner/compilation_manager.py` read
     # `self.model.step_fn_no_options`, where `self.model` is
     # `ModelInterface.model`. The torchax path sets the same attribute in
     # `models/vllm/vllm_model_wrapper.py`, so both paths define it.
     jit_model.step_fn_no_options = wrapped_model_fn_no_options
+    compute_logits_fn.head_leaves = _head_leaves
 
     return ModelInterface(
         model_fn=wrapped_model_fn,

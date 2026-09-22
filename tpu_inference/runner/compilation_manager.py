@@ -251,6 +251,50 @@ class CompilationManager:
                     self.runner.lora_config), jax.set_mesh(self.runner.mesh):
                 self._precompile_backbone_text_only()
                 self._flush_compilations()
+                if getattr(self.runner, "_fuse_h2d_metadata", False):
+                    from tpu_inference import utils as common_utils
+                    metadata_sharding = NamedSharding(
+                        self.runner.mesh, PartitionSpec(ShardingAxisName.BATCH))
+                    attn_spec = PartitionSpec(ShardingAxisName.ATTN_DATA)
+                    attn_seqs = self.runner.attn_max_num_seqs
+                    dp_size = self.runner.dp_size
+                    num_groups = len(
+                        self.runner.kv_cache_config.kv_cache_groups)
+                    max_blocks = self.runner.max_num_blocks_per_req
+                    for num_tokens in self.runner.num_tokens_paddings:
+                        for num_reqs in self.runner.num_reqs_paddings:
+                            if num_reqs > num_tokens:
+                                continue
+                            keys = [
+                                "input_ids",
+                                "query_start_loc",
+                                "seq_lens",
+                                "logits_indices",
+                            ]
+                            sizes = [
+                                num_tokens,
+                                attn_seqs + dp_size,
+                                attn_seqs,
+                                num_reqs,
+                            ]
+                            for gid in range(max(1, num_groups)):
+                                keys.append(f"block_tables_gid_{gid}")
+                                sizes.append(attn_seqs * max_blocks)
+                            keys.extend(["positions", "request_distribution"])
+                            sizes.extend([num_tokens, 3 * dp_size])
+                            layout = common_utils.DeviceBufferMetadata(
+                                keys=tuple(keys), sizes=tuple(sizes))
+                            shardings = tuple(
+                                attn_spec if k == "positions" else None
+                                for k in layout.keys)
+                            dummy_blob = self._create_dummy_tensor(
+                                (sum(sizes), ),
+                                jnp.int32,
+                                sharding=metadata_sharding)
+                            unpacked = common_utils.DeviceBuffer.unpack_arrays(
+                                dummy_blob, layout, shardings)
+                            jax.tree.map(lambda r: r.block_until_ready(),
+                                         unpacked)
                 if self.runner.is_multimodal_model:
                     if self.runner.precompile_vision_encoder_fn is not None:
                         self.runner.precompile_vision_encoder_fn(
@@ -961,7 +1005,8 @@ class CompilationManager:
                 self._run_compilation(
                     f"worker{self.runner.rank} compute_logits",
                     self.runner.compute_logits_fn,
-                    self.runner.state_leaves,
+                    getattr(self.runner, "compute_logits_leaves",
+                            self.runner.state_leaves),
                     hidden_states,
                     lora_metadata,
                     compile_only=True,
@@ -995,7 +1040,7 @@ class CompilationManager:
             sampling_metadata_sharding = NamedSharding(
                 self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
             logits = self._create_dummy_tensor((num_reqs, hsize),
-                                               jnp.float32,
+                                               self.runner.dtype,
                                                sharding=logits_sharding)
             for do_sampling in (True, False):
                 for logprobs in (True, False):
@@ -1049,6 +1094,54 @@ class CompilationManager:
                         logprobs=logprobs,
                         allow_distributed_sampling=allow_distributed_sampling,
                     )
+                    logits_and_sample_fn = getattr(self.runner,
+                                                   "logits_and_sample_fn",
+                                                   None)
+                    if logits_and_sample_fn is not None:
+                        hidden_size = (
+                            self.runner.model_config.get_hidden_size())
+                        hidden_sharding = NamedSharding(
+                            self.runner.mesh,
+                            PartitionSpec(ShardingAxisName.ATTN_DATA, None))
+                        metadata_sharding = NamedSharding(
+                            self.runner.mesh,
+                            PartitionSpec(ShardingAxisName.BATCH))
+                        raw_hidden = self._create_dummy_tensor(
+                            (max(num_reqs, 16), hidden_size),
+                            self.runner.dtype,
+                            sharding=hidden_sharding)
+                        dummy_indices = self._create_dummy_tensor(
+                            (num_reqs, ),
+                            jnp.int32,
+                            sharding=metadata_sharding)
+                        with jax.set_mesh(self.runner.mesh):
+                            dummy_hidden = self.runner._select_from_array_fn(
+                                raw_hidden, dummy_indices, self.runner.mesh,
+                                self.runner.vllm_config.sharding_config.
+                                prefill_cp_size)
+                        with self.runner.maybe_select_dummy_loras(
+                                self.runner.lora_config,
+                                np.array([num_reqs], dtype=np.int32)):
+                            lora_meta = (
+                                self.runner.lora_utils.extract_lora_metadata())
+                            self._run_compilation(
+                                f"worker{self.runner.rank} logits_and_sample",
+                                logits_and_sample_fn,
+                                getattr(self.runner, "compute_logits_leaves",
+                                        self.runner.state_leaves),
+                                dummy_hidden,
+                                lora_meta,
+                                self.runner.rng_params_for_sampling,
+                                sampling_metadata,
+                                call_kwargs={
+                                    "allow_distributed_sampling":
+                                    allow_distributed_sampling
+                                },
+                                compile_only=False,
+                                num_reqs=num_reqs,
+                                do_sampling=do_sampling,
+                                logprobs=logprobs,
+                            )
 
         self._sampling_precompiled = True
 
@@ -1962,44 +2055,97 @@ class CompilationManager:
 
     def _precompile_continue_decode(self) -> None:
         logger.info("Precompiling continue_decode loop.")
+        from tpu_inference import utils as common_utils
+        from tpu_inference.runner import utils as runner_utils
+        from tpu_inference.runner.tpu_runner import _compute_active_mask
         dp_size = self.runner.vllm_config.sharding_config.total_dp_size
         dp_spec = PartitionSpec(ShardingAxisName.ATTN_DATA, )
         dp_sharding = NamedSharding(self.runner.mesh, dp_spec)
+        replicated_sharding = NamedSharding(self.runner.mesh, PartitionSpec())
+        scalar_sharding = getattr(self.runner, "_scalar_sharding",
+                                  replicated_sharding)
 
         user_max_decode_steps = self.runner.vllm_config.additional_config.get(
             "max_decode_steps", DEFAULT_MAX_DECODE_STEPS)
 
-        # We only need to compile once for user_max_decode_steps
-
-        # We also need to construct TPUSupportedSamplingMetadata
-        # For greedy decoding, we can use empty parameters
-        _cache_collision_dummy = jnp.zeros((2, ), dtype=jnp.int32)
-        _cache_collision_dummy = device_array(self.runner.mesh,
-                                              _cache_collision_dummy)
-        sampling_metadata = TPUSupportedSamplingMetadata(
-            temperature=None,
-            top_k=None,
-            top_p=None,
-            _cache_collision_dummy=_cache_collision_dummy,
-            do_sampling=False,
-            logprobs=False)
+        _cache_collision_dummy = self._create_dummy_tensor(
+            (2, ), jnp.int32, sharding=scalar_sharding)
 
         for num_reqs in self.runner.num_reqs_paddings:
-            init_tokens = self._create_dummy_tensor((num_reqs, ), jnp.int32,
-                                                    dp_sharding)
-            active_mask = self._create_dummy_tensor((num_reqs, ), jnp.bool_,
-                                                    dp_sharding)
+            token_len = runner_utils.get_padded_token_len(
+                self.runner.num_tokens_paddings_per_dp,
+                num_reqs // dp_size) * dp_size
 
-            seq_lens = self._create_dummy_tensor((self.runner.max_num_reqs, ),
-                                                 jnp.int32, dp_sharding)
-            query_start_loc = self._create_dummy_tensor(
-                (self.runner.max_num_reqs + dp_size, ), jnp.int32, dp_sharding)
+            if getattr(self.runner, "_fuse_h2d_metadata", False):
+                metadata_sharding = NamedSharding(
+                    self.runner.mesh, PartitionSpec(ShardingAxisName.BATCH))
+                attn_seqs = self.runner.attn_max_num_seqs
+                num_groups = len(self.runner.kv_cache_config.kv_cache_groups)
+                max_blocks = self.runner.max_num_blocks_per_req
+                keys = [
+                    "input_ids",
+                    "query_start_loc",
+                    "seq_lens",
+                    "logits_indices",
+                ]
+                sizes = [
+                    token_len,
+                    attn_seqs + dp_size,
+                    attn_seqs,
+                    num_reqs,
+                ]
+                for gid in range(max(1, num_groups)):
+                    keys.append(f"block_tables_gid_{gid}")
+                    sizes.append(attn_seqs * max_blocks)
+                keys.extend(["positions", "request_distribution"])
+                sizes.extend([token_len, 3 * dp_size])
+                layout = common_utils.DeviceBufferMetadata(keys=tuple(keys),
+                                                           sizes=tuple(sizes))
+                shardings = tuple(
+                    dp_spec if k == "positions" else None for k in layout.keys)
+                dummy_blob = self._create_dummy_tensor(
+                    (sum(sizes), ), jnp.int32, sharding=metadata_sharding)
+                unpacked = common_utils.DeviceBuffer.unpack_arrays(
+                    dummy_blob, layout, shardings)
+                init_tokens = unpacked["input_ids"]
+                query_start_loc = unpacked["query_start_loc"]
+                seq_lens = unpacked["seq_lens"]
+                logits_indices = unpacked["logits_indices"]
+                positions = unpacked["positions"]
+                request_distribution = unpacked["request_distribution"]
+                active_mask = _compute_active_mask(logits_indices, dp_size,
+                                                   token_len // dp_size)
 
-            request_distribution = np.array([0, 0, 0] * dp_size,
-                                            dtype=np.int32)
-            request_distribution = device_array(self.runner.mesh,
-                                                request_distribution,
+                def build_block_table(kv_cache_gid: int) -> jax.Array:
+                    return unpacked[f"block_tables_gid_{kv_cache_gid}"]
+            else:
+                init_tokens = self._create_dummy_tensor((token_len, ),
+                                                        jnp.int32, dp_sharding)
+                positions = init_tokens
+                active_mask = self._create_dummy_tensor((token_len, ),
+                                                        jnp.bool_, dp_sharding)
+                seq_lens = self._create_dummy_tensor(
+                    (self.runner.max_num_reqs, ), jnp.int32, dp_sharding)
+                query_start_loc = self._create_dummy_tensor(
+                    (self.runner.max_num_reqs + dp_size, ), jnp.int32,
+                    dp_sharding)
+                request_distribution = np.array([0, 0, 0] * dp_size,
+                                                dtype=np.int32)
+                request_distribution = device_array(self.runner.mesh,
+                                                    request_distribution,
+                                                    sharding=dp_sharding)
+
+                def build_block_table(kv_cache_gid: int) -> jax.Array:
+                    block_table_obj = self.runner.input_batch.block_table[
+                        kv_cache_gid]
+                    shape = (self.runner.max_num_reqs,
+                             block_table_obj.max_num_blocks_per_req)
+                    block_tables = np.zeros(shape, dtype=np.int32)
+                    block_tables = block_tables.reshape(-1)
+                    block_tables = device_array(self.runner.mesh,
+                                                block_tables,
                                                 sharding=dp_sharding)
+                    return block_tables
 
             if (self.runner.kv_cache_config.has_mamba_layers
                     and getattr(self.runner.cache_config, "mamba_cache_mode",
@@ -2011,25 +2157,13 @@ class CompilationManager:
             else:
                 mamba_state_indices = None
 
-            def build_block_table(kv_cache_gid: int) -> jax.Array:
-                block_table_obj = self.runner.input_batch.block_table[
-                    kv_cache_gid]
-                shape = (self.runner.max_num_reqs,
-                         block_table_obj.max_num_blocks_per_req)
-                block_tables = np.zeros(shape, dtype=np.int32)
-                block_tables = block_tables.reshape(-1)
-                block_tables = device_array(self.runner.mesh,
-                                            block_tables,
-                                            sharding=dp_sharding)
-                return block_tables
-
             if len(self.runner.kv_cache_config.kv_cache_groups) <= 1:
                 no_kv_cache = len(
                     self.runner.kv_cache_config.kv_cache_groups) == 0
                 block_tables = build_block_table(
                     0) if not no_kv_cache else None
                 attn_metadata = AttentionMetadata(
-                    input_positions=init_tokens,
+                    input_positions=positions,
                     block_tables=block_tables,
                     seq_lens=seq_lens,
                     query_start_loc=query_start_loc,
@@ -2041,7 +2175,7 @@ class CompilationManager:
                 attn_metadata = GroupedAttentionMetadata(
                     groups=tuple(
                         AttentionMetadata(
-                            input_positions=init_tokens,
+                            input_positions=positions,
                             block_tables=build_block_table(gid),
                             seq_lens=seq_lens,
                             query_start_loc=query_start_loc,
@@ -2063,90 +2197,113 @@ class CompilationManager:
             )
 
             lora_metadata = self.runner.lora_utils.extract_lora_metadata()
+            sampling_sharding = (scalar_sharding
+                                 if dp_size == 1 else dp_sharding)
+            max_decode_steps_arr = jax.device_put(
+                np.array(user_max_decode_steps, dtype=np.int32),
+                scalar_sharding)
 
-            # Compile once for the max steps using JAX array for dynamic bound
-            max_decode_steps_arr = jnp.array(user_max_decode_steps,
-                                             dtype=jnp.int32)
+            for do_sampling in (True, False):
+                if do_sampling:
+                    temperature = self._create_dummy_tensor(
+                        (num_reqs, ), jnp.float32, sharding=sampling_sharding)
+                    top_k = self._create_dummy_tensor(
+                        (num_reqs, ), jnp.int32, sharding=sampling_sharding)
+                    top_p = self._create_dummy_tensor(
+                        (num_reqs, ), jnp.float32, sharding=sampling_sharding)
+                else:
+                    temperature = None
+                    top_k = None
+                    top_p = None
 
-            def continue_decode_wrapper(
-                state,
-                model_fn,
-                compute_logits_fn,
-                sample_fn,
-                mesh,
-                sampling_metadata,
-                init_state,
-                kv_caches,
-                max_decode_steps,
-                static_max_decode_steps,
-                eos_token_id,
-                padding_token_id,
-                rng,
-                layer_name_to_kvcache_index,
-                lora_metadata,
-                is_first_rank,
-                is_last_rank,
-                dp_size,
-                collect_expert_indices,
-                continue_decode_eos_check_interval,
-            ):
-                (generated_tokens, final_kv_caches, final_state, final_rng,
-                 all_expert_indices, logprobs_tensors) = continue_decode(
-                     state=state,
-                     model_fn=model_fn,
-                     compute_logits_fn=compute_logits_fn,
-                     sample_fn=sample_fn,
-                     mesh=mesh,
-                     sampling_metadata=sampling_metadata,
-                     init_state=init_state,
-                     kv_caches=kv_caches,
-                     max_decode_steps=max_decode_steps,
-                     static_max_decode_steps=static_max_decode_steps,
-                     eos_token_id=eos_token_id,
-                     padding_token_id=padding_token_id,
-                     rng=rng,
-                     layer_name_to_kvcache_index=layer_name_to_kvcache_index,
-                     lora_metadata=lora_metadata,
-                     is_first_rank=is_first_rank,
-                     is_last_rank=is_last_rank,
-                     dp_size=dp_size,
-                     collect_expert_indices=collect_expert_indices,
-                     max_logprobs=self.runner.model_config.max_logprobs,
-                     logprobs_mode=self.runner.model_config.logprobs_mode,
-                     continue_decode_eos_check_interval=
-                     continue_decode_eos_check_interval,
-                 )
-                self.runner.kv_caches = final_kv_caches
-                return generated_tokens
+                sampling_metadata = TPUSupportedSamplingMetadata(
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    _cache_collision_dummy=_cache_collision_dummy,
+                    do_sampling=do_sampling,
+                    logprobs=False)
 
-            def continue_decode_warmup(_fn, _args, _call_kwargs):
-                new_args = list(_args)
-                new_args[7] = self.runner.kv_caches
-                return _fn(*new_args, **_call_kwargs)
+                def continue_decode_wrapper(
+                    state,
+                    model_fn,
+                    compute_logits_fn,
+                    sample_fn,
+                    mesh,
+                    sampling_metadata,
+                    init_state,
+                    kv_caches,
+                    max_decode_steps,
+                    static_max_decode_steps,
+                    eos_token_id,
+                    padding_token_id,
+                    rng,
+                    layer_name_to_kvcache_index,
+                    lora_metadata,
+                    is_first_rank,
+                    is_last_rank,
+                    dp_size,
+                    collect_expert_indices,
+                    continue_decode_eos_check_interval,
+                ):
+                    (generated_tokens, final_kv_caches, final_state, final_rng,
+                     all_expert_indices, logprobs_tensors) = continue_decode(
+                         state=state,
+                         model_fn=model_fn,
+                         compute_logits_fn=compute_logits_fn,
+                         sample_fn=sample_fn,
+                         mesh=mesh,
+                         sampling_metadata=sampling_metadata,
+                         init_state=init_state,
+                         kv_caches=kv_caches,
+                         max_decode_steps=max_decode_steps,
+                         static_max_decode_steps=static_max_decode_steps,
+                         eos_token_id=eos_token_id,
+                         padding_token_id=padding_token_id,
+                         rng=rng,
+                         layer_name_to_kvcache_index=
+                         layer_name_to_kvcache_index,
+                         lora_metadata=lora_metadata,
+                         is_first_rank=is_first_rank,
+                         is_last_rank=is_last_rank,
+                         dp_size=dp_size,
+                         collect_expert_indices=collect_expert_indices,
+                         max_logprobs=self.runner.model_config.max_logprobs,
+                         logprobs_mode=self.runner.model_config.logprobs_mode,
+                         continue_decode_eos_check_interval=
+                         continue_decode_eos_check_interval,
+                     )
+                    self.runner.kv_caches = final_kv_caches
+                    return generated_tokens
 
-            self._run_compilation(
-                f"worker{self.runner.rank} continue_decode_steps_{user_max_decode_steps}_reqs_{num_reqs}",
-                continue_decode_wrapper,
-                self.runner.state_leaves,
-                self.runner.model.step_fn_no_options,
-                self.runner.compute_logits_fn,
-                sample,
-                self.runner.mesh,
-                sampling_metadata,
-                init_state,
-                self.runner.kv_caches,
-                max_decode_steps_arr,
-                user_max_decode_steps,
-                self.runner.eos_token_id,
-                self.runner.pad_token_id,
-                self.runner.rng_params_for_sampling,
-                tuple(self.runner.layer_name_to_kvcache_index.items()),
-                lora_metadata,
-                self.runner.is_first_rank,
-                self.runner.is_last_rank,
-                self.runner.dp_size,
-                getattr(self.runner.vllm_config.model_config,
-                        "enable_return_routed_experts", False),
-                self.runner.continue_decode_eos_check_interval,
-                warmup_handler=continue_decode_warmup,
-            )
+                def continue_decode_warmup(_fn, _args, _call_kwargs):
+                    new_args = list(_args)
+                    new_args[7] = self.runner.kv_caches
+                    return _fn(*new_args, **_call_kwargs)
+
+                self._run_compilation(
+                    f"worker{self.runner.rank} continue_decode_steps_{user_max_decode_steps}_reqs_{num_reqs}_sample_{do_sampling}",
+                    continue_decode_wrapper,
+                    self.runner.state_leaves,
+                    self.runner.model.step_fn_no_options,
+                    self.runner.compute_logits_fn,
+                    sample,
+                    self.runner.mesh,
+                    sampling_metadata,
+                    init_state,
+                    self.runner.kv_caches,
+                    max_decode_steps_arr,
+                    user_max_decode_steps,
+                    self.runner.eos_token_id,
+                    self.runner.pad_token_id,
+                    self.runner.rng_params_for_sampling,
+                    tuple(self.runner.layer_name_to_kvcache_index.items()),
+                    lora_metadata,
+                    self.runner.is_first_rank,
+                    self.runner.is_last_rank,
+                    self.runner.dp_size,
+                    getattr(self.runner.vllm_config.model_config,
+                            "enable_return_routed_experts", False),
+                    self.runner.continue_decode_eos_check_interval,
+                    warmup_handler=continue_decode_warmup,
+                )

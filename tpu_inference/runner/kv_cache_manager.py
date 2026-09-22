@@ -1049,8 +1049,9 @@ class KVCacheManager:
                              f"mamba_sharding={metadata['mamba'].sharding} | "
                              f"mamba_dtype={metadata['mamba'].dtype}")
 
-        log_parts.append(
-            f"hbm={utils.hbm_usage_gb(self.runner.mesh.devices.flatten())}Gb")
+        # initialize_kv_cache is what reinitialize_kv_cache calls, so this
+        # log-only line is reachable while a slower rank is still deleting.
+        log_parts.append(f"hbm=[hbm read removed: raced with concurrent x.delete()]")
 
         logger.info(" | ".join(log_parts))
 
@@ -1346,11 +1347,13 @@ class KVCacheManager:
             return
 
         num_layers = len(kv_caches)
+        # hbm_before= dropped: utils.hbm_usage_gb walks jax.live_arrays()
+        # and the other dp ranks are inside x.delete() at the same time.
+        # Segfaulted rl-mesh-s09 at dp16/tp1. See patch_meshdp_hbm_delete_race.
         logger.info(
             f"Deleting kv-cache | "
             f"num_layers={num_layers} | "
-            f"hbm_before="
-            f"{utils.hbm_usage_gb(self.runner.mesh.devices.flatten())}Gb")
+            f"hbm_before=[hbm read removed: raced with concurrent x.delete()]")
 
         # Explicitly delete each JAX array to release HBM.
         for kv_cache in kv_caches:
@@ -1360,8 +1363,7 @@ class KVCacheManager:
 
         logger.info(
             f"KV cache delete complete | "
-            f"hbm_after="
-            f"{utils.hbm_usage_gb(self.runner.mesh.devices.flatten())}Gb")
+            f"hbm_after=[hbm read removed: raced with concurrent x.delete()]")
 
     def reinitialize_kv_cache(self) -> None:
         """Reinitialize KV cache from the stored configuration.
@@ -1380,10 +1382,11 @@ class KVCacheManager:
                 "Cannot reinitialize KV cache: no kv_cache_config found. "
                 "initialize_kv_cache must be called first.")
 
+        # Reached right after this rank's delete, while slower ranks are
+        # still in their delete loop -- same race as above.
         logger.info(
             f"Reinitializing kv-cache | "
-            f"hbm_before="
-            f"{utils.hbm_usage_gb(self.runner.mesh.devices.flatten())}Gb")
+            f"hbm_before=[hbm read removed: raced with concurrent x.delete()]")
 
         with set_current_vllm_config(self.runner.vllm_config):
             self.initialize_kv_cache(kv_cache_config)

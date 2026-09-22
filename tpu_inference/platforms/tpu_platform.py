@@ -302,6 +302,26 @@ class TpuPlatform(Platform):
         incompatible = enable_dp_attention or vllm_envs.VLLM_TPU_USING_PATHWAYS
 
         requested = envs.TPU_MULTIPROCESS_DP
+
+        if envs.TPU_MESH_BASED_DP:
+            # Mesh-based DP is the other MPMD flavour: it keeps the ranks
+            # independent but isolates them with one `jax.sharding.Mesh` per
+            # rank inside a single process, instead of masking physical chips
+            # per process. The two cannot both own the DP ranks.
+            if requested:
+                raise ValueError(
+                    "TPU_MESH_BASED_DP=1 and TPU_MULTIPROCESS_DP=1 are "
+                    "mutually exclusive: both implement MPMD data "
+                    "parallelism. Pick one.")
+            if enable_dp_attention:
+                raise ValueError(
+                    "TPU_MESH_BASED_DP=1 is not supported with attention DP "
+                    "(enable_dp_attention).")
+            os.environ["TPU_MULTIPROCESS_DP"] = "0"
+            logger.info(
+                "Mesh-based DP requested; forcing TPU_MULTIPROCESS_DP=0")
+            return
+
         if requested is not None:
             if requested and incompatible:
                 raise ValueError(
@@ -317,6 +337,47 @@ class TpuPlatform(Platform):
                                              and not incompatible else "0")
         logger.info("Resolved TPU_MULTIPROCESS_DP=%s",
                     os.environ["TPU_MULTIPROCESS_DP"])
+
+    @classmethod
+    def pre_register_and_update(cls, parser=None) -> None:
+        """Adjust CLI defaults before `vllm serve` parses its arguments.
+
+        This is the only hook that runs early enough to change how many API
+        server processes are started: `ServeSubcommand.cmd` reads
+        `args.api_server_count` before any `VllmConfig` exists, so
+        `check_and_update_config` is already too late.
+        """
+        from tpu_inference.core import mesh_dp
+        mesh_dp.default_to_one_api_server(parser)
+
+    @classmethod
+    def _setup_mesh_dp(cls, vllm_config: VllmConfig) -> None:
+        """Make vLLM launch its DP ranks as threads instead of processes.
+
+        Mesh DP is the multi-process DP path with threads, so it changes only
+        the launcher: `mesh_dp.install()` rebinds `CoreEngineProcManager`, and
+        vLLM's own engine cores, load balancer and control plane are used
+        unchanged. See `tpu_inference/core/mesh_dp.py`.
+
+        That launcher only runs under the multiprocessing engine client, so
+        V1 multiprocessing has to be ON -- including offline, where it used to
+        be forced OFF. Nothing moves out of this process by turning it on: the
+        ranks are threads, so `LLM(...)` still has every rank, one profiler
+        and no IPC hop in its own address space.
+        """
+        from tpu_inference.core import mesh_dp
+        if not mesh_dp.is_mesh_dp_enabled(vllm_config):
+            return
+
+        mesh_dp.install()
+
+        if vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING:
+            return
+        logger.info("Mesh-based DP: enabling V1 multiprocessing so vLLM's "
+                    "DP engine launcher runs; the ranks stay in this process "
+                    "as threads.")
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "1"
+        vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING = True
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
@@ -337,6 +398,7 @@ class TpuPlatform(Platform):
                     "variable to be set and DP attention set via: --additional_config \'{\"sharding\": {\"sharding_strategy\": {\"enable_dp_attention\": true}}}\'"
                 )
         cls._initialize_sharding_config(vllm_config)
+        cls._setup_mesh_dp(vllm_config)
 
         cache_config = vllm_config.cache_config
         if (cache_config and getattr(cache_config, "mamba_cache_mode", "none")

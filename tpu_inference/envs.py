@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     TPU_WORKER_ID: str | None = None
     TPU_MULTIHOST_BACKEND: str = ""
     TPU_MULTIPROCESS_DP: bool | None = None
+    TPU_MESH_BASED_DP: bool = False
     PREFILL_SLICES: str = ""
     DECODE_SLICES: str = ""
     SKIP_JAX_PRECOMPILE: bool = False
@@ -45,6 +46,11 @@ if TYPE_CHECKING:
     USE_JAX_PROFILER_SERVER: bool = False
     JAX_PROFILER_SERVER_PORT: int = 9999
     CONTINUE_DECODE_EOS_CHECK_INTERVAL: int = 1
+    CONTINUE_DECODE_AFTER_PREFILL: bool = False
+    CONTINUE_DECODE_GATE_STATS: bool = False
+    MESH_DP_DISPATCH_LOCK: int = 1
+    HOST_PHASE_STATS: bool = False
+    FUSE_H2D_METADATA: bool = True
     USE_BATCHED_RPA_KERNEL: bool = False
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     # Optional operator override for the RPA v3 kernel block sizes, one per
@@ -247,6 +253,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and Pathways).
     "TPU_MULTIPROCESS_DP":
     env_bool("TPU_MULTIPROCESS_DP", default=None),
+    # Use mesh-based data parallelism: a single process hosts one independent
+    # engine per DP rank, each bound to its own `jax.sharding.Mesh` over a
+    # disjoint slice of `jax.devices()`. Like TPU_MULTIPROCESS_DP the ranks are
+    # fully independent (no cross-rank padding or step barrier), but the
+    # isolation comes from the JAX mesh rather than from masking physical chips
+    # with libtpu env vars. Mutually exclusive with TPU_MULTIPROCESS_DP.
+    "TPU_MESH_BASED_DP":
+    env_bool("TPU_MESH_BASED_DP", default=False),
     # Slice configuration for disaggregated prefill workers
     "PREFILL_SLICES":
     lambda: os.getenv("PREFILL_SLICES", ""),
@@ -378,6 +392,44 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stop), so the sampled distribution is unchanged. Default 1 = stock.
     "CONTINUE_DECODE_EOS_CHECK_INTERVAL":
     lambda: int(os.getenv("CONTINUE_DECODE_EOS_CHECK_INTERVAL") or "1"),
+    # continue_decode: after a step whose prefills all complete, keep going
+    # into the fused decode loop instead of returning to the scheduler. Without
+    # this the loop only runs when the batch is *already* decode-only, which
+    # under SPMD DP means one prefill on any rank disables it for all ranks.
+    "CONTINUE_DECODE_AFTER_PREFILL":
+    env_bool("CONTINUE_DECODE_AFTER_PREFILL"),
+    # Log how often the continue_decode gate fires vs. is blocked by a prefill.
+    "CONTINUE_DECODE_GATE_STATS":
+    env_bool("CONTINUE_DECODE_GATE_STATS"),
+    # Serialise device enqueues across a process's rank threads. Only has an
+    # effect under mesh DP, which is the only mode with more than one runner in
+    # a process. Donating the KV cache releases the GIL once per layer, and
+    # under 8-way contention each release costs a ~190us handoff round trip;
+    # the ranks do not overlap in the dispatch anyway. See `runner/utils.py`.
+    #   0 = off, 1 = the model dispatch only, 2 = every enqueue in the step.
+    # Never covers a call that waits on a result (`d2h`), only enqueues.
+    # 1 is the default because 2 measured WORSE than off: v6e-8 dp8/tp1
+    # 1024x1024, n=3 each, 14,267 tok/s at 0 and 15,236 at 1 but 12,504 at 2,
+    # with P99 TTFT 10.3-11.4s against 2.5s. Six acquires per step instead of
+    # one convoys the ranks, and each contended acquire is itself a handoff, so
+    # the small enqueues lose more to the lock than their ~2.4 switches cost.
+    "MESH_DP_DISPATCH_LOCK":
+    lambda: int(os.getenv("MESH_DP_DISPATCH_LOCK") or "1"),
+    # Break a host step down into its phases (input prep, H2D, each jit
+    # dispatch, D2H) and log the per-step budget. Mesh DP is GIL-bound, so the
+    # question is always which Python is holding the GIL, and a GIL profile
+    # gives shares rather than the microseconds needed to rank fixes.
+    "HOST_PHASE_STATS":
+    env_bool("HOST_PHASE_STATS"),
+    # Ship `input_positions` and `request_distribution` inside the same host
+    # metadata blob as everything else, so a step costs one `device_put` leaf
+    # instead of three. On TPU a `device_put` costs ~110us per leaf almost
+    # independently of size -- `request_distribution` is 12 bytes and costs
+    # about as much to ship as the whole blob -- and the transfer path is
+    # globally serialised, so mesh DP pays it per rank. Only applied when the
+    # shardings coincide; see `_fuse_h2d_metadata` in the runner.
+    "FUSE_H2D_METADATA":
+    env_bool("FUSE_H2D_METADATA", default=True),
     "USE_BATCHED_RPA_KERNEL":
     env_bool("USE_BATCHED_RPA_KERNEL"),
     "USE_BATCHED_RPA_SEQ_ON_LANE":
