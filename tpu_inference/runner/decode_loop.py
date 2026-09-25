@@ -409,51 +409,7 @@ def continue_decode(
     continue_decode_eos_check_interval: int = 1,
 ) -> tuple[jax.Array, Any, TpuSamplingState, jax.Array, jax.Array | None,
            Optional["LogprobsTensors"]]:
-    """Run the TPU decode loop as one fused, kv-cache-donating program.
-
-    Args:
-      state: Model state dict (weights; passed through, not donated).
-      model_fn: Stable model forward callable.
-      compute_logits_fn: Stable logits callable.
-      sample_fn: Stable sampling callable with signature
-        (rng, mesh, logits, sampling_metadata, allow_distributed_sampling=...)
-        -> (next_tokens, _). Must be a stable object (not a per-call closure)
-        so the jit cache persists; per-call sampling data is threaded via
-        `sampling_metadata`.
-      init_state: Initial TpuSamplingState.
-      kv_caches: KV caches. Donated into the fused loop and returned updated.
-      max_decode_steps: Max steps to run (static loop bound).
-      static_max_decode_steps: Static maximum steps for RNG splitting.
-      eos_token_id: EOS token ID(s).
-      padding_token_id: Padding token ID.
-      rng: RNG key.
-      mesh: Device mesh (static; stable runner object).
-      sampling_metadata: Per-call sampling metadata pytree (traced).
-      inputs_embeds: Optional input embeddings.
-      layer_name_to_kvcache_index: Mapping from layer name to KV cache index.
-      lora_metadata: Optional LoRA metadata.
-      intermediate_tensors: Optional intermediate tensors.
-      is_first_rank: Whether this is the first PP rank.
-      is_last_rank: Whether this is the last PP rank.
-      dp_size: Data parallel size.
-      collect_expert_indices: Whether model_fn returns routed-expert indices
-        (caller derives this from
-        vllm_config.model_config.enable_return_routed_experts). When True the
-        expert-indices shape is discovered via jax.eval_shape (no execution)
-        to presize the accumulation buffer.
-      max_logprobs: Minimum number of logprobs to retain per token.
-      logprobs_mode: Logprobs mode from model config. The processed modes
-        (see PROCESSED_LOGPROBS_MODES) read sample()'s transformed logits;
-        the raw modes read compute_logits' output.
-
-    Returns:
-      Tuple of (generated_tokens, final_kv_caches, final_state, final_rng,
-      all_expert_indices, logprobs_tensors). generated_tokens is a fixed-size
-      (max_decode_steps, batch_size) array and all_expert_indices, when not
-      None, is (max_decode_steps, ...); rows beyond final_state.step_counter
-      are padding (early EOS exit may stop before max_decode_steps), so the
-      caller must trim with final_state.step_counter.
-    """
+    """Run the TPU decode loop as one fused, kv-cache-donating program."""
 
     batch_size = init_state.current_tokens.shape[0]
     seq_lens_size = init_state.attn_metadata.seq_lens.shape[0]
@@ -569,7 +525,8 @@ def continue_decode(
             request_distribution=attn.request_distribution,
             mamba_state_indices=attn.mamba_state_indices,
         ),
-        step_counter=step_counter.astype(jnp.int32),
+        step_counter=(step_counter if step_counter.dtype == jnp.int32 else
+                      step_counter.astype(jnp.int32)),
     )
 
     all_expert_indices = expert_buffer if has_experts else None
@@ -584,3 +541,4 @@ def continue_decode(
 
     return (token_buffer, kv_caches, final_state, current_rng,
             all_expert_indices, logprobs_tensors)
+

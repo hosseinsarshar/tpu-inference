@@ -235,6 +235,36 @@ def _log_continue_decode_summary(
         num_eos_hits)
 
 
+_USE_COLOCATED_PYTHON = os.environ.get("TPU_USE_COLOCATED_PYTHON", "0") == "1"
+
+
+def _colocated_extract_valid_lengths(
+    generated_tokens: jax.Array,
+    eos_token_ids: jax.Array,
+) -> Tuple[jax.Array, jax.Array]:
+    """Optional colocated_python helper to compute valid_lens on worker CPU."""
+    from jax.experimental import colocated_python
+
+    @colocated_python.colocated_python
+    def _extract_fn(tokens: jax.Array, eos_ids: jax.Array):
+        tokens_np = np.asarray(tokens).T
+        eos_np = np.asarray(eos_ids)
+        valid_lens_np, has_eos_np = _extract_valid_lengths_host(
+            tokens_np, eos_np)
+        cpu_sharding = tokens.sharding
+        return (
+            jax.device_put(valid_lens_np.astype(np.int32), cpu_sharding),
+            jax.device_put(np.int32(has_eos_np.sum()), cpu_sharding),
+        )
+
+    cpu_devs = colocated_python.colocated_cpu_devices(
+        tuple(generated_tokens.sharding.device_set))
+    cpu_sharding = jax.sharding.SingleDeviceSharding(cpu_devs[0])
+    tokens_cpu = jax.device_put(generated_tokens, cpu_sharding)
+    eos_cpu = jax.device_put(eos_token_ids, cpu_sharding)
+    return _extract_fn(tokens_cpu, eos_cpu)
+
+
 def _process_continue_decode_outputs(
     generated_tokens: jax.Array,
     actual_steps: Union[jax.Array, int],
@@ -261,26 +291,27 @@ def _process_continue_decode_outputs(
     updates input_batch, scheduler_output, and attn_metadata for synchronous
     runs.
     """
-    generated_tokens_cpu, actual_steps_cpu = jax.device_get(
-        (generated_tokens, actual_steps))
-
-    all_expert_indices_cpu = None
-    if expert_indices is not None:
-        all_expert_indices_cpu = jax.device_get(expert_indices)
-
-    lp_token_ids_cpu = None
-    lp_vals_cpu = None
-    lp_ranks_cpu = None
-    if logprobs_tensors is not None:
-        (
-            lp_token_ids_cpu,
-            lp_vals_cpu,
-            lp_ranks_cpu,
-        ) = jax.device_get((
-            logprobs_tensors.logprob_token_ids,
-            logprobs_tensors.logprobs,
-            logprobs_tensors.selected_token_ranks,
-        ))
+    lp_ids_dev = (logprobs_tensors.logprob_token_ids
+                  if logprobs_tensors is not None else None)
+    lp_vals_dev = (logprobs_tensors.logprobs
+                   if logprobs_tensors is not None else None)
+    lp_ranks_dev = (logprobs_tensors.selected_token_ranks
+                    if logprobs_tensors is not None else None)
+    (
+        generated_tokens_cpu,
+        actual_steps_cpu,
+        all_expert_indices_cpu,
+        lp_token_ids_cpu,
+        lp_vals_cpu,
+        lp_ranks_cpu,
+    ) = jax.device_get((
+        generated_tokens,
+        actual_steps,
+        expert_indices,
+        lp_ids_dev,
+        lp_vals_dev,
+        lp_ranks_dev,
+    ))
 
     actual_steps_int = int(actual_steps_cpu)
     generated_tokens_cpu = np.asarray(generated_tokens_cpu)[:actual_steps_int]
