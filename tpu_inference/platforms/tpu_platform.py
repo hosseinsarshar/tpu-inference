@@ -352,32 +352,20 @@ class TpuPlatform(Platform):
 
     @classmethod
     def _setup_mesh_dp(cls, vllm_config: VllmConfig) -> None:
-        """Make vLLM launch its DP ranks as threads instead of processes.
-
-        Mesh DP is the multi-process DP path with threads, so it changes only
-        the launcher: `mesh_dp.install()` rebinds `CoreEngineProcManager`, and
-        vLLM's own engine cores, load balancer and control plane are used
-        unchanged. See `tpu_inference/core/mesh_dp.py`.
-
-        That launcher only runs under the multiprocessing engine client, so
-        V1 multiprocessing has to be ON -- including offline, where it used to
-        be forced OFF. Nothing moves out of this process by turning it on: the
-        ranks are threads, so `LLM(...)` still has every rank, one profiler
-        and no IPC hop in its own address space.
-        """
-        from tpu_inference.core import mesh_dp
+        from tpu_inference.core import mesh_dp_inproc as mesh_dp
         if not mesh_dp.is_mesh_dp_enabled(vllm_config):
             return
 
         mesh_dp.install()
 
-        if vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING:
+        online_serving = getattr(vllm_config.parallel_config,
+                                 "_api_process_rank", 0) == -1
+        if online_serving:
             return
-        logger.info("Mesh-based DP: enabling V1 multiprocessing so vLLM's "
-                    "DP engine launcher runs; the ranks stay in this process "
-                    "as threads.")
-        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "1"
-        vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING = True
+        logger.info("Mesh-based DP: disabling V1 multiprocessing so the "
+                    "offline engine is built in this process.")
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING = False
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:

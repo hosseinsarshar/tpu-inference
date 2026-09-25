@@ -242,8 +242,8 @@ class MeshDPExecutor(UniProcExecutor):
         with _DEVICE_INIT_LOCK:
             self.driver_worker.init_worker(all_kwargs=[kwargs])
             self.driver_worker.init_device()
-        self.driver_worker.load_model()
-        current_platform.update_block_size_for_backend(self.vllm_config)
+            self.driver_worker.load_model()
+            current_platform.update_block_size_for_backend(self.vllm_config)
 
 
 class _SchedulerProxy:

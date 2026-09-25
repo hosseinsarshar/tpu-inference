@@ -1753,8 +1753,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         # Clear JIT compilation caches from weight loading to free XLA
         # program reservations (bytes_reserved) on TPU HBM.
-        jax.clear_caches()
-        logger.info("Cleared JIT caches after weight loading")
+        if not os.environ.get("TPU_MESH_BASED_DP", "0").lower() in ("1", "true", "yes"):
+            jax.clear_caches()
+            logger.info("Cleared JIT caches after weight loading")
 
         logger.info(f"Init model | "
                     f"hbm={common_utils.hbm_usage_gb(self.devices)}GiB")

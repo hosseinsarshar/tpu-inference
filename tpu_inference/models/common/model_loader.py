@@ -1,3 +1,4 @@
+import os
 # Copyright 2025 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -368,39 +369,44 @@ def get_flax_model(
     # costs ~17 ms/step on Gemma-4-31B decode at TP=2.
     _state_treedef = jax.tree_util.tree_structure(state)
     _raw_state_leaves = tuple(jax.tree_util.tree_leaves(state))
-    _leaf_groups: Dict[Any, List[int]] = {}
-    for _idx, _arr in enumerate(_raw_state_leaves):
-        if isinstance(_arr, jax.Array):
-            _gkey = (_arr.shape, _arr.dtype, _arr.sharding)
-            _leaf_groups.setdefault(_gkey, []).append(_idx)
-    _packed_leaves_list: List[Any] = []
-    _packed_is_stacked: List[bool] = []
-    _unpack_map: List[Tuple[int, Optional[int]]] = [(-1, None)] * len(
-        _raw_state_leaves)
-    for _gkey, _indices in _leaf_groups.items():
-        if len(_indices) >= 4:
-            _p_idx = len(_packed_leaves_list)
-            _stacked = jax.jit(lambda xs: jax.numpy.stack(xs, axis=0))(
-                [_raw_state_leaves[i] for i in _indices])
-            _packed_leaves_list.append(_stacked)
-            _packed_is_stacked.append(True)
-            for _s_idx, _orig_i in enumerate(_indices):
-                _unpack_map[_orig_i] = (_p_idx, _s_idx)
-        else:
-            for _orig_i in _indices:
+    if os.environ.get("ENABLE_WEIGHT_PACKING", "0") == "1":
+        _leaf_groups: Dict[Any, List[int]] = {}
+        for _idx, _arr in enumerate(_raw_state_leaves):
+            if isinstance(_arr, jax.Array):
+                _gkey = (_arr.shape, _arr.dtype, _arr.sharding)
+                _leaf_groups.setdefault(_gkey, []).append(_idx)
+        _packed_leaves_list: List[Any] = []
+        _packed_is_stacked: List[bool] = []
+        _unpack_map: List[Tuple[int, Optional[int]]] = [(-1, None)] * len(
+            _raw_state_leaves)
+        for _gkey, _indices in _leaf_groups.items():
+            if len(_indices) >= 4:
                 _p_idx = len(_packed_leaves_list)
-                _packed_leaves_list.append(_raw_state_leaves[_orig_i])
+                _stacked = jax.jit(lambda xs: jax.numpy.stack(xs, axis=0))(
+                    [_raw_state_leaves[i] for i in _indices])
+                _packed_leaves_list.append(_stacked)
+                _packed_is_stacked.append(True)
+                for _s_idx, _orig_i in enumerate(_indices):
+                    _unpack_map[_orig_i] = (_p_idx, _s_idx)
+            else:
+                for _orig_i in _indices:
+                    _p_idx = len(_packed_leaves_list)
+                    _packed_leaves_list.append(_raw_state_leaves[_orig_i])
+                    _packed_is_stacked.append(False)
+                    _unpack_map[_orig_i] = (_p_idx, None)
+        for _idx, _arr in enumerate(_raw_state_leaves):
+            if _unpack_map[_idx][0] == -1:
+                _p_idx = len(_packed_leaves_list)
+                _packed_leaves_list.append(_arr)
                 _packed_is_stacked.append(False)
-                _unpack_map[_orig_i] = (_p_idx, None)
-    for _idx, _arr in enumerate(_raw_state_leaves):
-        if _unpack_map[_idx][0] == -1:
-            _p_idx = len(_packed_leaves_list)
-            _packed_leaves_list.append(_arr)
-            _packed_is_stacked.append(False)
-            _unpack_map[_idx] = (_p_idx, None)
-    _packed_state_leaves = tuple(_packed_leaves_list)
-    _packed_is_stacked_tuple = tuple(_packed_is_stacked)
-    _unpack_map_tuple = tuple(_unpack_map)
+                _unpack_map[_idx] = (_p_idx, None)
+        _packed_state_leaves = tuple(_packed_leaves_list)
+        _packed_is_stacked_tuple = tuple(_packed_is_stacked)
+        _unpack_map_tuple = tuple(_unpack_map)
+    else:
+        _packed_state_leaves = _raw_state_leaves
+        _packed_is_stacked_tuple = ()
+        _unpack_map_tuple = ()
     logger.info("Packed %d model weight leaves into %d stacked leaves",
                 len(_raw_state_leaves), len(_packed_state_leaves))
 
