@@ -684,11 +684,14 @@ def _jax_logprobs_materialize(
         runner: Optional[Any] = None,
         num_reqs: Optional[int] = None) -> LogprobsLists:
     """Materializes logprobs from JAX arrays into NumPy-backed LogprobsLists."""
-    log_token_ids = np.asarray(
-        jax.device_get(logprobs_tensors.logprob_token_ids))
-    logprobs_arr = np.asarray(jax.device_get(logprobs_tensors.logprobs))
-    selected_token_ranks = np.asarray(
-        jax.device_get(logprobs_tensors.selected_token_ranks))
+    raw_ids, raw_vals, raw_ranks = jax.device_get((
+        logprobs_tensors.logprob_token_ids,
+        logprobs_tensors.logprobs,
+        logprobs_tensors.selected_token_ranks,
+    ))
+    log_token_ids = np.asarray(raw_ids)
+    logprobs_arr = np.asarray(raw_vals)
+    selected_token_ranks = np.asarray(raw_ranks)
 
     # For speculative decoding, we need to filter and reorganize the materialized
     # logprobs. The raw logprobs contain info for all proposed draft tokens (including
@@ -729,9 +732,9 @@ def _jax_logprobs_materialize(
             cu_num_generated_tokens = list(range(num_reqs + 1))
 
     return LogprobsLists(
-        logprob_token_ids=np.array(log_token_ids.tolist()),
-        logprobs=np.array(logprobs_arr.tolist()),
-        sampled_token_ranks=np.array(selected_token_ranks.tolist()),
+        logprob_token_ids=np.asarray(log_token_ids),
+        logprobs=np.asarray(logprobs_arr),
+        sampled_token_ranks=np.asarray(selected_token_ranks),
         cu_num_generated_tokens=cu_num_generated_tokens,
     )
 
@@ -2482,12 +2485,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             computed[:num_reqs] = saved_computed
             self.input_batch.request_distribution = saved_distribution
 
-        if sampling_metadata.logprobs:
-            # Merging the loop's per-step logprobs with the ones the mixed step
-            # already produced is not worth the complexity; fall back.
-            self._cd_chain_bailed += 1
-            return output
-
         assert next_tokens.shape == input_ids.shape, (
             f"sampled tokens {next_tokens.shape} do not match the decode "
             f"input layout {input_ids.shape}")
@@ -2513,9 +2510,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # this step.
         with self.maybe_forbid_compile, \
              set_forward_context(None, self.vllm_config), \
-             self._phase("cd_loop"), self._enqueue_lock:
+             self._phase("cd_loop"), self._dispatch_lock:
             (generated_tokens, final_kv_caches, final_state, final_rng, _,
-             _) = continue_decode(
+             logprobs_tensors) = continue_decode(
                  state=self.state_leaves,
                  model_fn=self.model.step_fn_no_options,
                  compute_logits_fn=self.compute_logits_fn,
@@ -2553,12 +2550,19 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # its in-flight token accounting goes negative. The extra tokens reach
         # the scheduler through the length of sampled_token_ids, which
         # patch_vllm_scheduler_for_continue_decode already handles.
-        continued_token_ids, _, _, _, _ = _process_continue_decode_outputs(
+        (
+            continued_token_ids,
+            continued_logprobs,
+            _,
+            _,
+            _,
+        ) = _process_continue_decode_outputs(
             generated_tokens=generated_tokens,
             actual_steps=final_state.step_counter,
             req_ids=req_ids,
             eos_token_id=self.eos_token_id,
             indices_selector=tokens_indices_selector,
+            logprobs_tensors=logprobs_tensors,
             requests=self.requests,
             block_size=self.block_size,
             input_batch=self.input_batch,
@@ -2571,11 +2575,46 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # (its row stays active), but vLLM trims the returned list at the stop
         # token, so the extra tokens are discarded rather than emitted.
         sampled = output.sampled_token_ids
+        init_lens = [len(s) for s in sampled]
         self._cd_chain_fired += 1
         for i, extra in enumerate(continued_token_ids):
             if extra and i < len(sampled) and sampled[i]:
                 sampled[i].extend(extra)
                 self._cd_chain_tokens += len(extra)
+
+        if output.logprobs is not None and continued_logprobs is not None:
+            init_lp = output.logprobs
+            cont_lp = continued_logprobs
+            merged_ids = []
+            merged_vals = []
+            merged_ranks = []
+            for i, init_len in enumerate(init_lens):
+                p_start = (init_lp.cu_num_generated_tokens[i]
+                           if init_lp.cu_num_generated_tokens is not None else i)
+                p_end = p_start + init_len
+                if p_end > p_start:
+                    merged_ids.append(init_lp.logprob_token_ids[p_start:p_end])
+                    merged_vals.append(init_lp.logprobs[p_start:p_end])
+                    merged_ranks.append(
+                        init_lp.sampled_token_ranks[p_start:p_end])
+                extra_len = len(sampled[i]) - init_len
+                if extra_len > 0:
+                    c_start = (
+                        cont_lp.cu_num_generated_tokens[i]
+                        if cont_lp.cu_num_generated_tokens is not None else i)
+                    c_end = c_start + extra_len
+                    merged_ids.append(cont_lp.logprob_token_ids[c_start:c_end])
+                    merged_vals.append(cont_lp.logprobs[c_start:c_end])
+                    merged_ranks.append(
+                        cont_lp.sampled_token_ranks[c_start:c_end])
+            if merged_ids:
+                output.logprobs = LogprobsLists(
+                    logprob_token_ids=np.concatenate(merged_ids, axis=0),
+                    logprobs=np.concatenate(merged_vals, axis=0),
+                    sampled_token_ranks=np.concatenate(merged_ranks, axis=0),
+                    cu_num_generated_tokens=[0] +
+                    list(np.cumsum([len(x) for x in sampled])),
+                )
         return output
 
     def _get_min_remaining_slots(self) -> int:

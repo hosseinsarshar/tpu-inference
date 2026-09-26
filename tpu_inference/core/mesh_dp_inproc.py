@@ -254,8 +254,9 @@ class _SchedulerProxy:
     operations are exposed; anything per-request goes through the owning rank.
     """
 
-    def __init__(self, engines: List[vLLMEngineCore]):
+    def __init__(self, engines: List[vLLMEngineCore], core: Optional[Any] = None):
         self._engines = engines
+        self._core = core
         self._forwarded: set = set()
 
     def __getattr__(self, name: str):
@@ -285,9 +286,19 @@ class _SchedulerProxy:
         return getattr(self._engines[0].scheduler, name)
 
     def has_requests(self) -> bool:
+        if self._core is not None and (
+            self._core._has_staged_adds
+            or any(not q.empty() for q in self._core._in_q)
+        ):
+            return True
         return any(e.scheduler.has_requests() for e in self._engines)
 
     def has_unfinished_requests(self) -> bool:
+        if self._core is not None and (
+            self._core._has_staged_adds
+            or any(not q.empty() for q in self._core._in_q)
+        ):
+            return True
         return any(e.scheduler.has_unfinished_requests()
                    for e in self._engines)
 
@@ -622,7 +633,7 @@ class MeshDPEngineCore(vLLMEngineCore):
         # --- vLLM-facing attributes whose mesh value is not rank 0's ---
         # Everything else `EngineCore.__init__` would have set is read off
         # rank 0 on demand; see `__getattr__`.
-        self.scheduler = _SchedulerProxy(self.engines)
+        self.scheduler = _SchedulerProxy(self.engines, self)
         # The rank engines each own a real batch queue. This object never
         # executes a batch itself, it only harvests, so it must not look like
         # it has one.
@@ -682,6 +693,11 @@ class MeshDPEngineCore(vLLMEngineCore):
             queue.Queue() for _ in range(self.dp_size)
         ]
         self._out_q: queue.Queue = queue.Queue()
+        self._batching_adds: bool = not isinstance(self, EngineCoreProc)
+        self._staged_adds: List[List[Tuple[Request, int]]] = [
+            [] for _ in range(self.dp_size)
+        ]
+        self._has_staged_adds: bool = False
         self._live = True
         self._threads = [
             threading.Thread(target=self._rank_loop,
@@ -800,17 +816,24 @@ class MeshDPEngineCore(vLLMEngineCore):
         if kind == "add":
             _, request, request_wave = op
             engine.add_request(request, request_wave)
+        elif kind == "add_batch":
+            _, batch = op
+            for request, request_wave in batch:
+                engine.add_request(request, request_wave)
         elif kind == "abort":
             _, request_ids = op
             engine.abort_requests(request_ids)
             for rid in request_ids:
                 self._forget_request(rid, rank)
         elif kind == "call":
-            _, fn, args, kwargs, result_box = op
+            _, fn, args, kwargs, result_box, done_ev = op
             try:
                 result_box.append(("ok", fn(engine, *args, **kwargs)))
             except Exception as e:  # surfaced to the caller
                 result_box.append(("err", e))
+            finally:
+                if done_ev is not None:
+                    done_ev.set()
         elif kind == "stop":
             pass
 
@@ -860,6 +883,20 @@ class MeshDPEngineCore(vLLMEngineCore):
     # EngineCore API
     # ------------------------------------------------------------------
 
+    def flush_batch_submission(self) -> int:
+        """Flush staged offline requests so each rank wakes once with its full batch."""
+        if not self._has_staged_adds:
+            return 0
+        self._has_staged_adds = False
+        total = 0
+        for rank, staged in enumerate(self._staged_adds):
+            if staged:
+                batch = list(staged)
+                staged.clear()
+                total += len(batch)
+                self._in_q[rank].put_nowait(("add_batch", batch))
+        return total
+
     def add_request(self, request: Request, request_wave: int = 0) -> None:
         if getattr(self, "_round_robin_routing", False):
             idx = getattr(self, "_rr_next_rank", 0)
@@ -868,7 +905,11 @@ class MeshDPEngineCore(vLLMEngineCore):
             self._stats[rank]["routed"] += 1
             with self._req_rank_lock:
                 self._req_rank[request.request_id] = rank
-            self._in_q[rank].put_nowait(("add", request, request_wave))
+            if self._batching_adds:
+                self._staged_adds[rank].append((request, request_wave))
+                self._has_staged_adds = True
+            else:
+                self._in_q[rank].put_nowait(("add", request, request_wave))
             return
         num_tokens = request.num_tokens
         # max_tokens is an upper bound (the request may stop early on EOS), but
@@ -883,9 +924,15 @@ class MeshDPEngineCore(vLLMEngineCore):
             self._req_rank[request.request_id] = rank
         self._req_prompt_tokens[request.request_id] = num_tokens
         self._req_decode_left[request.request_id] = num_decode_tokens
-        self._in_q[rank].put_nowait(("add", request, request_wave))
+        if self._batching_adds:
+            self._staged_adds[rank].append((request, request_wave))
+            self._has_staged_adds = True
+        else:
+            self._in_q[rank].put_nowait(("add", request, request_wave))
 
     def abort_requests(self, request_ids: List[str]) -> None:
+        if self._has_staged_adds:
+            self.flush_batch_submission()
         by_rank: Dict[int, List[str]] = {}
         with self._req_rank_lock:
             for rid in request_ids:
@@ -911,6 +958,8 @@ class MeshDPEngineCore(vLLMEngineCore):
         Ranks run ahead on their own; this only harvests. Outputs for the same
         client are merged so a client never loses a rank's tokens for a step.
         """
+        if self._has_staged_adds:
+            self.flush_batch_submission()
         self._outer["calls"] += 1
         self._maybe_report()
         t_wait = time.perf_counter()
@@ -984,21 +1033,25 @@ class MeshDPEngineCore(vLLMEngineCore):
         Control-plane calls (profile, reset caches, LoRA) must not touch a rank
         engine from the caller's thread while the rank thread is mid-step.
         """
+        if self._has_staged_adds:
+            self.flush_batch_submission()
         boxes = []
+        events = []
         for rank in range(self.dp_size):
             box: List[Tuple[str, Any]] = []
+            ev = threading.Event()
             boxes.append(box)
-            self._in_q[rank].put_nowait(("call", fn, (), {}, box))
+            events.append(ev)
+            self._in_q[rank].put_nowait(("call", fn, (), {}, box, ev))
 
         results = []
         deadline = time.monotonic() + 300.0
-        for rank, box in enumerate(boxes):
-            while not box:
-                if time.monotonic() > deadline:
-                    raise TimeoutError(
-                        f"Mesh-based DP rank {rank} did not answer a "
-                        f"control-plane call within 300s")
-                time.sleep(0.001)
+        for rank, (box, ev) in enumerate(zip(boxes, events)):
+            remaining = max(0.0, deadline - time.monotonic())
+            if not ev.wait(timeout=remaining) or not box:
+                raise TimeoutError(
+                    f"Mesh-based DP rank {rank} did not answer a "
+                    f"control-plane call within 300s")
             status, value = box[0]
             if status == "err":
                 raise value
