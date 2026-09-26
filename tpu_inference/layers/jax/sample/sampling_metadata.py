@@ -104,6 +104,44 @@ class TPUSupportedSamplingMetadata:
             temp_cur = input_batch.temperature_cpu[:n]
             top_k_cur = input_batch.top_k_cpu[:n]
             top_p_cur = input_batch.top_p_cpu[:n]
+            if (n > 0 and np.all(temp_cur == temp_cur[0])
+                    and np.all(top_k_cur == top_k_cur[0])
+                    and np.all(top_p_cur == top_p_cur[0])):
+                u_key = (
+                    padded_num_reqs,
+                    needs_logprobs,
+                    sharding,
+                    float(temp_cur[0]),
+                    int(top_k_cur[0]),
+                    float(top_p_cur[0]),
+                )
+                cached_u = _SAMPLING_META_CACHE.get((mesh, "uniform"))
+                if cached_u is not None and cached_u[0] == u_key:
+                    return cached_u[1]
+                temp_tensor = np.full((padded_num_reqs, ),
+                                      temp_cur[0],
+                                      dtype=temp_cur.dtype)
+                top_k_tensor = np.full((padded_num_reqs, ),
+                                       top_k_cur[0],
+                                       dtype=top_k_cur.dtype)
+                top_p_tensor = np.full((padded_num_reqs, ),
+                                       top_p_cur[0],
+                                       dtype=top_p_cur.dtype)
+                temperature_dev, top_p_dev, top_k_dev = device_array(
+                    mesh,
+                    (temp_tensor, top_p_tensor, top_k_tensor),
+                    sharding=sharding,
+                )
+                result = cls(
+                    temperature=temperature_dev,
+                    top_p=top_p_dev,
+                    top_k=top_k_dev,
+                    _cache_collision_dummy=cache_collision_dummy,
+                    do_sampling=not input_batch.all_greedy,
+                    logprobs=needs_logprobs,
+                )
+                _SAMPLING_META_CACHE[(mesh, "uniform")] = (u_key, result)
+                return result
             cached = _SAMPLING_META_CACHE.get(mesh)
             if (cached is not None and cached[0] == padded_num_reqs
                     and cached[1] == n and cached[2] == needs_logprobs

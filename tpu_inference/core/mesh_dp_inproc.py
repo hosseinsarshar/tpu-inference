@@ -862,8 +862,9 @@ class MeshDPEngineCore(vLLMEngineCore):
 
     def add_request(self, request: Request, request_wave: int = 0) -> None:
         if getattr(self, "_round_robin_routing", False):
-            rank = getattr(self, "_rr_next_rank", 0)
-            self._rr_next_rank = (rank + 1) % self.dp_size
+            idx = getattr(self, "_rr_next_rank", 0)
+            self._rr_next_rank = idx + 1
+            rank = (idx + (idx // self.dp_size) * 9) % self.dp_size
             self._stats[rank]["routed"] += 1
             with self._req_rank_lock:
                 self._req_rank[request.request_id] = rank

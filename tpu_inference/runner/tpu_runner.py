@@ -1740,6 +1740,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.get_mrope_input_positions_fn = model.multimodal_fns.get_mrope_input_positions_fn
 
         rng_key = jax.random.PRNGKey(self.model_config.seed)
+        if envs.TPU_MESH_BASED_DP and self.devices:
+            rng_key = jax.random.fold_in(rng_key, self.devices[0].id)
         self.rng_params_for_sampling = device_array(self.mesh,
                                                     rng_key,
                                                     sharding=NamedSharding(
