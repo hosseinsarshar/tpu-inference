@@ -120,6 +120,24 @@ def test_distributed_sampling_max_top_k(monkeypatch: pytest.MonkeyPatch):
     assert envs.DISTRIBUTED_SAMPLING_MAX_TOP_K == 32
 
 
+def test_distributed_sampling_fast_paths(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("DISTRIBUTED_SAMPLING_TOPK_CHUNK", raising=False)
+    monkeypatch.delenv("DISTRIBUTED_SAMPLING_SORTED_TOPP", raising=False)
+    assert envs.DISTRIBUTED_SAMPLING_TOPK_CHUNK == -1
+    assert envs.DISTRIBUTED_SAMPLING_SORTED_TOPP is True
+    monkeypatch.setenv("DISTRIBUTED_SAMPLING_TOPK_CHUNK", "0")
+    monkeypatch.setenv("DISTRIBUTED_SAMPLING_SORTED_TOPP", "0")
+    assert envs.DISTRIBUTED_SAMPLING_TOPK_CHUNK == 0
+    assert envs.DISTRIBUTED_SAMPLING_SORTED_TOPP is False
+
+
+def test_continue_decode_skip_finished_attn(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("CONTINUE_DECODE_SKIP_FINISHED_ATTN", raising=False)
+    assert envs.CONTINUE_DECODE_SKIP_FINISHED_ATTN is False
+    monkeypatch.setenv("CONTINUE_DECODE_SKIP_FINISHED_ATTN", "1")
+    assert envs.CONTINUE_DECODE_SKIP_FINISHED_ATTN is True
+
+
 def test_moe_stage_weights_on_host(monkeypatch: pytest.MonkeyPatch):
     """MOE_STAGE_WEIGHTS_ON_HOST is opt-in: off unless it is asked for."""
     monkeypatch.delenv("MOE_STAGE_WEIGHTS_ON_HOST", raising=False)

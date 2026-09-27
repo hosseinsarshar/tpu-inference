@@ -18,17 +18,19 @@ from unittest import mock
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh
 from vllm.v1.outputs import LogprobsTensors
 
 from tpu_inference import envs
+from tpu_inference.layers.common.binary_search import topp_mask
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.jax.sample.sampling import (
     PromptLogprobsAsyncData, PromptLogprobsReqSnap, _apply_sampling_transforms,
-    _can_sample_distributed, _merge_topk_candidates, compute_logprobs,
-    compute_prompt_logprobs, distributed_sampling_allowed, gather_logprobs,
-    sample)
+    _can_sample_distributed, _merge_topk_candidates, _prefiltered_top_k,
+    _topp_mask_sorted, compute_logprobs, compute_prompt_logprobs,
+    distributed_sampling_allowed, gather_logprobs, sample)
 from tpu_inference.layers.jax.sample.sampling_metadata import \
     TPUSupportedSamplingMetadata
 
@@ -127,6 +129,46 @@ class TestSampling:
             jnp.array([0.95], dtype=jnp.float32),
         )
         assert bool(incomplete[0])
+
+    @pytest.mark.parametrize("strided", [True, False])
+    @pytest.mark.parametrize("chunk", [None, 8, 32])
+    def test_prefiltered_top_k_matches_lax_top_k(self, chunk, strided):
+        logits = jax.random.normal(jax.random.key(3), (4, 4096),
+                                   dtype=jnp.float32) * 3.0
+        # bf16-rounded logits carry many exact ties.
+        tied = logits.astype(jnp.bfloat16).astype(jnp.float32)
+        for values in (logits, tied):
+            expected, _ = jax.lax.top_k(values, 128)
+            actual, ids = _prefiltered_top_k(values,
+                                             128,
+                                             chunk=chunk,
+                                             strided=strided)
+            np.testing.assert_array_equal(actual, expected)
+            np.testing.assert_array_equal(
+                jnp.take_along_axis(values, ids, axis=1), actual)
+            assert all(
+                len(set(row)) == 128 for row in np.asarray(ids).tolist())
+
+    def test_sorted_topp_matches_topp_mask(self):
+        rng = np.random.default_rng(0)
+        values = (rng.normal(size=(64, 256)) *
+                  rng.uniform(0.5, 6.0, size=(64, 1))).astype(np.float32)
+        values[:, 100:] = -1e12  # Candidates already dropped by top-k.
+        top_p = rng.choice([0.5, 0.8, 0.95], size=64).astype(np.float32)
+        # Compare rows whose running mass is not within rounding of top_p.
+        ordered = -np.sort(-values.astype(np.float64), axis=-1)
+        probs = np.exp(ordered - ordered[:, :1])
+        cumulative = np.cumsum(probs / probs.sum(-1, keepdims=True), axis=-1)
+        clear = np.min(np.abs(cumulative - top_p[:, None]), axis=-1) > 1e-4
+        assert clear.sum() > 48
+        expected = topp_mask(jnp.asarray(values),
+                             jnp.asarray(top_p),
+                             replace_val=-1e12)
+        actual = _topp_mask_sorted(jnp.asarray(values), jnp.asarray(top_p),
+                                   -1e12)
+        np.testing.assert_array_equal(
+            np.asarray(actual)[clear],
+            np.asarray(expected)[clear])
 
     def test_compute_logprobs(self):
         logits = jnp.array([[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]],

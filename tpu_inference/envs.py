@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     CONTINUE_DECODE_EOS_CHECK_INTERVAL: int = 1
     CONTINUE_DECODE_AFTER_PREFILL: bool = False
     CONTINUE_DECODE_GATE_STATS: bool = False
+    CONTINUE_DECODE_SKIP_FINISHED_ATTN: bool = False
     MESH_DP_DISPATCH_LOCK: int = 1
     HOST_PHASE_STATS: bool = False
     FUSE_H2D_METADATA: bool = True
@@ -97,6 +98,8 @@ if TYPE_CHECKING:
     VERIFY_WEIGHTS: bool = False
     SAMPLING_MICROBATCH_SIZE: int = 0
     DISTRIBUTED_SAMPLING_MAX_TOP_K: int = 64
+    DISTRIBUTED_SAMPLING_TOPK_CHUNK: int = -1
+    DISTRIBUTED_SAMPLING_SORTED_TOPP: bool = True
     RAIDEN_H2D_SETTLE: bool = True
 
 
@@ -401,6 +404,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Log how often the continue_decode gate fires vs. is blocked by a prefill.
     "CONTINUE_DECODE_GATE_STATS":
     env_bool("CONTINUE_DECODE_GATE_STATS"),
+    # continue_decode: a row that hit EOS stays in the batch until the window
+    # ends. Give it a one-token attention window on page 0 (vLLM's null block)
+    # so it stops reading its whole KV cache every step. Its outputs are
+    # discarded and its own pages are never written, so the generated tokens
+    # are unchanged. Off by default: the RPA kernel is 2.2x faster with 24 of
+    # 32 rows finished, but the qwen3-0.6b RL rollout (dp=64, tp=2, 1024-step
+    # windows) showed no step-time change, since few finished rows linger.
+    "CONTINUE_DECODE_SKIP_FINISHED_ATTN":
+    env_bool("CONTINUE_DECODE_SKIP_FINISHED_ATTN", default=False),
     # Serialise device enqueues across a process's rank threads. Only has an
     # effect under mesh DP, which is the only mode with more than one runner in
     # a process. Donating the KV cache releases the GIL once per layer, and
@@ -611,6 +623,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # read at trace time so candidate tensor shapes remain static.
     "DISTRIBUTED_SAMPLING_MAX_TOP_K":
     lambda: int(os.getenv("DISTRIBUTED_SAMPLING_MAX_TOP_K", "64")),
+    # Chunk size for the exact chunk-max prefilter in front of the per-shard
+    # candidate top-k. -1 picks a size automatically, 0 uses a plain top-k
+    # over the whole vocabulary shard.
+    "DISTRIBUTED_SAMPLING_TOPK_CHUNK":
+    lambda: int(os.getenv("DISTRIBUTED_SAMPLING_TOPK_CHUNK", "-1")),
+    # Apply top-p to the gathered candidates with one sort and a cumulative
+    # sum instead of a 32-step binary search.
+    "DISTRIBUTED_SAMPLING_SORTED_TOPP":
+    env_bool("DISTRIBUTED_SAMPLING_SORTED_TOPP", default=True),
     # RL weight sync: wait for the async Raiden H2D DMA to settle before
     # letting the rollout resume. See RaidenWorkerSync._wait_until_settled.
     "RAIDEN_H2D_SETTLE":

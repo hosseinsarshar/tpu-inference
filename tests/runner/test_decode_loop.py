@@ -22,8 +22,9 @@ from tpu_inference.layers.common.sharding import MESH_AXIS_NAMES
 from tpu_inference.layers.jax.sample.sampling_metadata import \
     TPUSupportedSamplingMetadata
 from tpu_inference.runner.decode_loop import (TpuSamplingState,
-                                              _decode_core_impl, _split_rngs,
-                                              _update_loop_state,
+                                              _decode_core_impl,
+                                              _finished_row_attention_inputs,
+                                              _split_rngs, _update_loop_state,
                                               continue_decode)
 
 
@@ -100,6 +101,27 @@ def test_update_loop_state_dp_padding():
     assert np.array_equal(new_seq_lens, [12, 21, 0, 32, 42, 0])
     assert np.array_equal(step_record_tokens, [42, 99, 43, 44])
     assert any_hit_eos
+
+
+def test_finished_row_attention_inputs_dp_padding():
+    # 4 requests total (2 per DP rank), DP = 2, pad_len = 1. Request 1 (rank
+    # 0) and request 2 (rank 1) have finished.
+    active_mask = jnp.array([True, False, False, True], dtype=jnp.bool_)
+    input_positions = jnp.array([10, 20, 30, 40], dtype=jnp.int32)
+    # seq_lens: [11, 21, 0,  31, 41, 0]  (last one in each DP rank is padding)
+    seq_lens = jnp.array([11, 21, 0, 31, 41, 0], dtype=jnp.int32)
+    block_tables = jnp.arange(1, 6 * 3 + 1, dtype=jnp.int32)  # 3 pages/row
+
+    positions, attn_seq_lens, tables = _finished_row_attention_inputs(
+        active_mask, input_positions, seq_lens, block_tables, 2, 1)
+
+    assert np.array_equal(positions, [10, 0, 0, 40])
+    assert np.array_equal(attn_seq_lens, [11, 1, 0, 1, 41, 0])
+    tables = np.asarray(tables).reshape(6, 3)
+    original = np.asarray(block_tables).reshape(6, 3)
+    # Finished and padding rows point at page 0, vLLM's null block.
+    assert np.array_equal(tables[:, 0], [1, 0, 0, 0, 13, 0])
+    assert np.array_equal(tables[:, 1:], original[:, 1:])
 
 
 def test_split_rngs():

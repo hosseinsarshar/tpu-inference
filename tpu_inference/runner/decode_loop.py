@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 from vllm.v1.outputs import LogprobsTensors
 
+from tpu_inference import envs
 from tpu_inference.layers.common.attention_metadata import (
     AttentionMetadata, SharedAttentionMetadata)
 from tpu_inference.models.common.compiler_options import \
@@ -94,6 +95,40 @@ def _split_rngs(rng, static_size, dynamic_size):
     return all_rngs[:static_size], all_rngs[dynamic_size]
 
 
+def _finished_row_attention_inputs(
+    active_mask: jax.Array,
+    input_positions: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    dp_size: int,
+    pad_len: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Attention inputs that give each finished row a one-token window.
+
+    A row that hit EOS stays in the batch until the window ends, and would
+    otherwise re-read its whole KV cache on every step. Here it gets
+    seq_len 1 and its first page becomes page 0. vLLM reserves page 0 as the
+    null block, so the row's discarded KV write never lands in a live page,
+    even if the host later continues the request. Active rows are unchanged.
+    Padding rows keep seq_len 0, so their page 0 entry is never read.
+
+    Returns (positions, seq_lens, block_tables) for the attention metadata.
+    """
+    # Align the per-token active mask with seq_lens the same way
+    # `_update_loop_state` aligns its increment.
+    active_2d = active_mask.reshape(dp_size, -1)
+    if pad_len > 0:
+        active_2d = jnp.pad(active_2d, ((0, 0), (0, pad_len)))
+    else:
+        active_2d = active_2d[:, :seq_lens.shape[0] // dp_size]
+    active_rows = active_2d.ravel()
+    attn_seq_lens = jnp.where(active_rows, seq_lens, jnp.minimum(seq_lens, 1))
+    tables = block_tables.reshape(seq_lens.shape[0], -1)
+    tables = tables.at[:, 0].set(jnp.where(active_rows, tables[:, 0], 0))
+    attn_positions = jnp.where(active_mask, input_positions, 0)
+    return attn_positions, attn_seq_lens, tables.reshape(block_tables.shape)
+
+
 def _decode_core_impl(
     *,
     state,
@@ -157,19 +192,35 @@ def _decode_core_impl(
             logprobs=sampling_metadata.logprobs,
         )
 
+    # See `_finished_row_attention_inputs`. The loop carry keeps the real
+    # positions and seq_lens for the host. Context-parallel meshes split each
+    # sequence's KV across ranks, so they keep the plain inputs.
+    skip_finished_attn = (envs.CONTINUE_DECODE_SKIP_FINISHED_ATTN
+                          and getattr(block_tables, "ndim", 0) >= 1
+                          and block_tables.size % seq_lens.shape[0] == 0
+                          and mesh.shape.get("dcp", 1) == 1
+                          and mesh.shape.get("pcp", 1) == 1)
+
+    def _attention_inputs(am, pos, sl):
+        if not skip_finished_attn:
+            return pos, sl, block_tables
+        return _finished_row_attention_inputs(am, pos, sl, block_tables,
+                                              dp_size, pad_len)
+
     def _run_one_step(step_idx, ct, am, pos, sl, kvc):
         step_rng = step_rngs[step_idx]
+        attn_pos, attn_sl, attn_block_tables = _attention_inputs(am, pos, sl)
         attn_metadata = AttentionMetadata(
-            input_positions=pos,
-            block_tables=block_tables,
-            seq_lens=sl,
+            input_positions=attn_pos,
+            block_tables=attn_block_tables,
+            seq_lens=attn_sl,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
             mamba_state_indices=mamba_state_indices,
         )
         shared_attn_metadata = SharedAttentionMetadata(
-            input_positions=pos,
-            seq_lens=sl,
+            input_positions=attn_pos,
+            seq_lens=attn_sl,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
             mamba_state_indices=mamba_state_indices,
