@@ -138,6 +138,13 @@ def test_continue_decode_skip_finished_attn(monkeypatch: pytest.MonkeyPatch):
     assert envs.CONTINUE_DECODE_SKIP_FINISHED_ATTN is True
 
 
+def test_continue_decode_skip_mixed_rpa(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("CONTINUE_DECODE_SKIP_MIXED_RPA", raising=False)
+    assert envs.CONTINUE_DECODE_SKIP_MIXED_RPA is True
+    monkeypatch.setenv("CONTINUE_DECODE_SKIP_MIXED_RPA", "0")
+    assert envs.CONTINUE_DECODE_SKIP_MIXED_RPA is False
+
+
 def test_moe_stage_weights_on_host(monkeypatch: pytest.MonkeyPatch):
     """MOE_STAGE_WEIGHTS_ON_HOST is opt-in: off unless it is asked for."""
     monkeypatch.delenv("MOE_STAGE_WEIGHTS_ON_HOST", raising=False)

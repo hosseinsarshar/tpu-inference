@@ -443,8 +443,14 @@ def sharded_ragged_paged_attention(
     use_causal_mask: bool = True,
     attn_logits_soft_cap: float | None = None,
     decode_query_size: int = 1,
+    decode_only: bool = False,
 ):
-    """Shards along KV heads."""
+    """Shards along KV heads.
+
+    decode_only: every sequence has one query token (distribution is
+    (n, n, n) on every rank). The v3 kernel then launches only its decode
+    pass. Other kernels ignore it.
+    """
     # Handle GQA/MQA where num_kv_heads < tp_size
     # We replicate KV heads to match tp_size so that we can shard them evenly.
     # TODO (ranlihao): This is not performant and introduces extra overhead during inference. We need to handle this during weight loading
@@ -517,6 +523,8 @@ def sharded_ragged_paged_attention(
                 # RPA_V3_*_BLOCK_SIZES are v3-kernel knobs; the experimental
                 # batched kernel takes its own BlockSizes configs instead.
                 kwargs.update(rpa_block_size_kwargs())
+                if decode_only:
+                    kwargs["decode_only"] = True
         return func(*args, **kwargs)
 
     return jax.shard_map(
@@ -621,6 +629,7 @@ def attention(
         use_causal_mask=use_causal_mask,
         attn_logits_soft_cap=attn_logits_soft_cap,
         decode_query_size=decode_query_size,
+        decode_only=getattr(md, "decode_only", False),
     )
 
     return kv_cache, output

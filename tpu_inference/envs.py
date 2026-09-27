@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     CONTINUE_DECODE_AFTER_PREFILL: bool = False
     CONTINUE_DECODE_GATE_STATS: bool = False
     CONTINUE_DECODE_SKIP_FINISHED_ATTN: bool = False
+    CONTINUE_DECODE_SKIP_MIXED_RPA: bool = True
     MESH_DP_DISPATCH_LOCK: int = 1
     HOST_PHASE_STATS: bool = False
     FUSE_H2D_METADATA: bool = True
@@ -413,6 +414,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # windows) showed no step-time change, since few finished rows linger.
     "CONTINUE_DECODE_SKIP_FINISHED_ATTN":
     env_bool("CONTINUE_DECODE_SKIP_FINISHED_ATTN", default=False),
+    # continue_decode: every row carries one query token, so the RPA v3
+    # prefill and mixed passes have no sequences to process. Mark the loop's
+    # attention metadata decode-only so the kernel launches only its decode
+    # pass (saves one empty launch per layer per step).
+    "CONTINUE_DECODE_SKIP_MIXED_RPA":
+    env_bool("CONTINUE_DECODE_SKIP_MIXED_RPA", default=True),
     # Serialise device enqueues across a process's rank threads. Only has an
     # effect under mesh DP, which is the only mode with more than one runner in
     # a process. Donating the KV cache releases the GIL once per layer, and

@@ -217,6 +217,9 @@ def _decode_core_impl(
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
             mamba_state_indices=mamba_state_indices,
+            # Both callers (`_execute_continue_decode` and the chained path)
+            # enter the loop with a (n, n, n) distribution: one token per row.
+            decode_only=envs.CONTINUE_DECODE_SKIP_MIXED_RPA,
         )
         shared_attn_metadata = SharedAttentionMetadata(
             input_positions=attn_pos,

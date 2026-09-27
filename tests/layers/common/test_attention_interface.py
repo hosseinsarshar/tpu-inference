@@ -556,7 +556,7 @@ class TestSegmentIdsFromCuSeqlens:
 # ---- Tests for the RPA v3 block-size env overrides ----
 
 
-def _capture_rpa_kwargs(monkeypatch, mesh, head_dim=128):
+def _capture_rpa_kwargs(monkeypatch, mesh, head_dim=128, decode_only=False):
     """Call `attention` with a stubbed RPA kernel and return its kwargs.
 
     Deliberately does not reuse `_test_attention`: that helper installs its own
@@ -591,6 +591,7 @@ def _capture_rpa_kwargs(monkeypatch, mesh, head_dim=128):
         seq_lens=jnp.array([5, 5, 0, 0], dtype=jnp.int32),
         query_start_loc=jnp.array([0, 5, 10, 10, 10], dtype=jnp.int32),
         request_distribution=jnp.array([0, 0, NUM_SEQS], dtype=jnp.int32),
+        decode_only=decode_only,
     )
     shared_attention_metadata = SharedAttentionMetadata(
         input_positions=jnp.arange(TOTAL_TOKENS, dtype=jnp.int32),
@@ -654,3 +655,57 @@ def test_rpa_block_sizes_not_forwarded_to_batched_kernel(monkeypatch, mesh):
     kwargs = _capture_rpa_kwargs(monkeypatch, mesh)
     assert "d_block_sizes" not in kwargs
     assert "decode_query_size" in kwargs
+
+
+# ---- Tests for the decode-only RPA launch skip ----
+
+
+def test_decode_only_forwarded_to_v3_kernel(monkeypatch, mesh):
+    """Decode-only metadata (the fused decode loop) reaches the v3 kernel.
+
+    Mixed-batch metadata must not pass the flag: the kernel would then skip
+    the pass that handles prefill rows.
+    """
+    monkeypatch.delenv("USE_BATCHED_RPA_KERNEL", raising=False)
+    assert "decode_only" not in _capture_rpa_kwargs(monkeypatch, mesh)
+    kwargs = _capture_rpa_kwargs(monkeypatch, mesh, decode_only=True)
+    assert kwargs["decode_only"] is True
+
+
+def test_decode_only_not_forwarded_to_batched_kernel(monkeypatch, mesh):
+    """The experimental batched kernel has no decode_only parameter."""
+    monkeypatch.setenv("USE_BATCHED_RPA_KERNEL", "1")
+    kwargs = _capture_rpa_kwargs(monkeypatch, mesh, decode_only=True)
+    assert "decode_only" not in kwargs
+
+
+def test_v3_kernel_decode_only_defaults_off():
+    """Callers that do not know their batch layout keep all three passes."""
+    import inspect
+
+    from tpu_inference.kernels.ragged_paged_attention.v3 import kernel
+    params = inspect.signature(kernel.ragged_paged_attention).parameters
+    assert params["decode_only"].default is False
+
+
+def test_attention_metadata_decode_only_is_static():
+    """decode_only is pytree aux data, not a leaf.
+
+    So a jit retraces when it flips instead of reusing a decode-only trace
+    for a mixed batch.
+    """
+
+    def metadata(decode_only):
+        return AttentionMetadata(
+            input_positions=jnp.zeros((4, ), dtype=jnp.int32),
+            request_distribution=jnp.array([4, 4, 4], dtype=jnp.int32),
+            decode_only=decode_only,
+        )
+
+    assert AttentionMetadata(
+        input_positions=jnp.zeros((4, ), dtype=jnp.int32)).decode_only is False
+    leaves_off, tree_off = jax.tree_util.tree_flatten(metadata(False))
+    leaves_on, tree_on = jax.tree_util.tree_flatten(metadata(True))
+    assert len(leaves_off) == len(leaves_on)
+    assert tree_off != tree_on
+    assert jax.tree_util.tree_unflatten(tree_on, leaves_on).decode_only is True

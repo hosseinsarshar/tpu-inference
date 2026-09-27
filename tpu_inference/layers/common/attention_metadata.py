@@ -68,7 +68,7 @@ class PCPMetadata:
         "mamba_state_indices",
         "pcp",
     ],
-    meta_fields=["padded_num_reqs", "pcp_cache_pages"],
+    meta_fields=["padded_num_reqs", "pcp_cache_pages", "decode_only"],
 )
 @dataclass
 class AttentionMetadata(object):
@@ -104,6 +104,12 @@ class AttentionMetadata(object):
 
     # PCP only. Number of kv pages occupied by the current request.
     pcp_cache_pages: int | None = None
+
+    # True only if every request has exactly one query token, i.e.
+    # request_distribution is (n, n, n) on every DP rank, as in the fused
+    # continue_decode loop. Attention kernels may then skip their prefill and
+    # mixed passes. Static, so it is part of every jit cache key.
+    decode_only: bool = False
 
 
 @functools.partial(
