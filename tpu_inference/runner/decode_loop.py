@@ -208,6 +208,7 @@ def _decode_core_impl(
              dp_size,
              pad_len,
          )
+        next_input_ids = jnp.where(new_active_mask, next_input_ids, ct)
 
         lp_ids_step = None
         lp_val_step = None
