@@ -44,7 +44,11 @@ if TYPE_CHECKING:
     LAYOUT_Q_PROJ_AS_NDH: bool = False
     USE_JAX_PROFILER_SERVER: bool = False
     JAX_PROFILER_SERVER_PORT: int = 9999
-    CONTINUE_DECODE_EOS_CHECK_INTERVAL: int = 1
+    CONTINUE_DECODE_EOS_CHECK_INTERVAL: int = 16
+    CONTINUE_DECODE_AFTER_PREFILL: bool = False
+    CONTINUE_DECODE_GATE_STATS: bool = False
+    CONTINUE_DECODE_SKIP_FINISHED_ATTN: bool = False
+    CONTINUE_DECODE_SKIP_MIXED_RPA: bool = True
     USE_BATCHED_RPA_KERNEL: bool = False
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     # Optional operator override for the RPA v3 kernel block sizes, one per
@@ -92,6 +96,8 @@ if TYPE_CHECKING:
     VERIFY_WEIGHTS: bool = False
     SAMPLING_MICROBATCH_SIZE: int = 0
     DISTRIBUTED_SAMPLING_MAX_TOP_K: int = 64
+    DISTRIBUTED_SAMPLING_TOPK_CHUNK: int = -1
+    DISTRIBUTED_SAMPLING_SORTED_TOPP: bool = True
     RAIDEN_H2D_SETTLE: bool = True
 
 
@@ -378,7 +384,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stop at their own EOS (the <=N-1 extra tokens are masked like a normal
     # stop), so the sampled distribution is unchanged. Default 1 = stock.
     "CONTINUE_DECODE_EOS_CHECK_INTERVAL":
-    lambda: int(os.getenv("CONTINUE_DECODE_EOS_CHECK_INTERVAL") or "1"),
+    lambda: int(os.getenv("CONTINUE_DECODE_EOS_CHECK_INTERVAL") or "16"),
+    "CONTINUE_DECODE_AFTER_PREFILL":
+    env_bool("CONTINUE_DECODE_AFTER_PREFILL"),
+    "CONTINUE_DECODE_GATE_STATS":
+    env_bool("CONTINUE_DECODE_GATE_STATS"),
+    "CONTINUE_DECODE_SKIP_FINISHED_ATTN":
+    env_bool("CONTINUE_DECODE_SKIP_FINISHED_ATTN", default=False),
+    "CONTINUE_DECODE_SKIP_MIXED_RPA":
+    env_bool("CONTINUE_DECODE_SKIP_MIXED_RPA", default=True),
     "USE_BATCHED_RPA_KERNEL":
     env_bool("USE_BATCHED_RPA_KERNEL"),
     "USE_BATCHED_RPA_SEQ_ON_LANE":
@@ -567,6 +581,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # read at trace time so candidate tensor shapes remain static.
     "DISTRIBUTED_SAMPLING_MAX_TOP_K":
     lambda: int(os.getenv("DISTRIBUTED_SAMPLING_MAX_TOP_K", "64")),
+    "DISTRIBUTED_SAMPLING_TOPK_CHUNK":
+    lambda: int(os.getenv("DISTRIBUTED_SAMPLING_TOPK_CHUNK", "-1")),
+    "DISTRIBUTED_SAMPLING_SORTED_TOPP":
+    env_bool("DISTRIBUTED_SAMPLING_SORTED_TOPP", default=True),
     # RL weight sync: wait for the async Raiden H2D DMA to settle before
     # letting the rollout resume. See RaidenWorkerSync._wait_until_settled.
     "RAIDEN_H2D_SETTLE":
