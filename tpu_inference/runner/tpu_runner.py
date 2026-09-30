@@ -1891,6 +1891,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             computed[:num_reqs] = saved_computed
             self.input_batch.request_distribution = saved_distribution
 
+        # The sampler returns replicated tokens, but the precompiled loop
+        # expects the DP-sharded decode layout. Match it to avoid a recompile.
+        if next_tokens.sharding != input_ids.sharding:
+            next_tokens = jax.device_put(next_tokens, input_ids.sharding)
         assert next_tokens.shape == input_ids.shape, (
             f"sampled tokens {next_tokens.shape} do not match the decode "
             f"input layout {input_ids.shape}")
