@@ -858,17 +858,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             "max_decode_steps", DEFAULT_MAX_DECODE_STEPS)
         self.eos_token_id = runner_utils.get_eos_token_id(self.model_config)
         self.pad_token_id = runner_utils.get_pad_token_id(self.model_config)
-        self._cd_gate_stats = envs.CONTINUE_DECODE_GATE_STATS
-        self._cd_gate_counts = {
-            "decode_only": 0,
-            "prefill_completes": 0,
-            "prefill_partial": 0,
-        }
         self._cd_chain_pending = False
         self._cd_chain_next_tokens: jax.Array | None = None
-        self._cd_chain_fired = 0
-        self._cd_chain_bailed = 0
-        self._cd_chain_tokens = 0
         self._max_decode_steps_arrays: dict[int, jax.Array] = {}
         self._scalar_sharding = NamedSharding(self.mesh, PartitionSpec())
 
@@ -1670,17 +1661,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                         False)
         if (is_decode_only and self.enable_continue_decode
                 and not has_structured_output):
-            if self._cd_gate_stats:
-                self._record_cd_gate("decode_only")
             return self._execute_continue_decode(scheduler_output)
 
         if self.enable_continue_decode:
-            will_be_decode_only = self._will_be_decode_only(scheduler_output)
-            if self._cd_gate_stats:
-                self._record_cd_gate("prefill_completes" if will_be_decode_only
-                                     else "prefill_partial")
-            self._cd_chain_pending = (will_be_decode_only
-                                      and self._can_chain_continue_decode())
+            self._cd_chain_pending = (
+                self._can_chain_continue_decode()
+                and self._will_be_decode_only(scheduler_output))
 
         # TODO(pooyam): I guess we can remove returning sampling_metadata in `_prepare_inputs` after https://github.com/njhill/vllm/commit/b7433ca1a47732394b1bdea4099d98389515954b
         (
@@ -1843,21 +1829,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         )
         return None
 
-    def _record_cd_gate(self, case: str) -> None:
-        counts = self._cd_gate_counts
-        counts[case] += 1
-        total = counts["decode_only"] + counts["prefill_completes"] + counts[
-            "prefill_partial"]
-        if total % 5 == 0:
-            logger.info(
-                "continue_decode gate over %d steps: decode_only=%.1f%% "
-                "prefill_completes=%.1f%% prefill_partial=%.1f%% | "
-                "chained=%d bailed=%d extra_tokens=%d", total,
-                100.0 * counts["decode_only"] / total,
-                100.0 * counts["prefill_completes"] / total,
-                100.0 * counts["prefill_partial"] / total, self._cd_chain_fired,
-                self._cd_chain_bailed, self._cd_chain_tokens)
-
     def _will_be_decode_only(self, scheduler_output: "VllmSchedulerOutput"
                              ) -> bool:
         if scheduler_output.scheduled_spec_decode_tokens:
@@ -1875,8 +1846,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         return True
 
     def _can_chain_continue_decode(self) -> bool:
-        return (envs.CONTINUE_DECODE_AFTER_PREFILL
-                and self.enable_continue_decode
+        return (self.enable_continue_decode
                 and self.static_max_decode_steps > 1
                 and not self.scheduler_config.async_scheduling
                 and self.speculative_config is None
@@ -1893,7 +1863,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         next_tokens = self._cd_chain_next_tokens
         self._cd_chain_next_tokens = None
         if next_tokens is None:
-            self._cd_chain_bailed += 1
             return output
 
         num_reqs = self.input_batch.num_reqs
@@ -1902,7 +1871,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         max_decode_steps = min(self.static_max_decode_steps - 1,
                                self._get_min_remaining_slots())
         if max_decode_steps <= 0:
-            self._cd_chain_bailed += 1
             return output
 
         computed = self.input_batch.num_computed_tokens_cpu
@@ -2001,11 +1969,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         sampled = output.sampled_token_ids
         init_lens = [len(s) for s in sampled]
-        self._cd_chain_fired += 1
         for i, extra in enumerate(continued_token_ids):
             if extra and i < len(sampled) and sampled[i]:
                 sampled[i].extend(extra)
-                self._cd_chain_tokens += len(extra)
 
         if output.logprobs is not None and continued_logprobs is not None:
             init_lp = output.logprobs

@@ -20,7 +20,6 @@ import jax
 import jax.numpy as jnp
 from vllm.v1.outputs import LogprobsTensors
 
-from tpu_inference import envs
 from tpu_inference.layers.common.attention_metadata import (
     AttentionMetadata, SharedAttentionMetadata)
 from tpu_inference.models.common.compiler_options import \
@@ -195,8 +194,7 @@ def _decode_core_impl(
     # See `_finished_row_attention_inputs`. The loop carry keeps the real
     # positions and seq_lens for the host. Context-parallel meshes split each
     # sequence's KV across ranks, so they keep the plain inputs.
-    skip_finished_attn = (envs.CONTINUE_DECODE_SKIP_FINISHED_ATTN
-                          and getattr(block_tables, "ndim", 0) >= 1
+    skip_finished_attn = (getattr(block_tables, "ndim", 0) >= 1
                           and block_tables.size % seq_lens.shape[0] == 0
                           and mesh.shape.get("dcp", 1) == 1
                           and mesh.shape.get("pcp", 1) == 1)
@@ -219,7 +217,7 @@ def _decode_core_impl(
             mamba_state_indices=mamba_state_indices,
             # Both callers (`_execute_continue_decode` and the chained path)
             # enter the loop with a (n, n, n) distribution: one token per row.
-            decode_only=envs.CONTINUE_DECODE_SKIP_MIXED_RPA,
+            decode_only=True,
         )
         shared_attn_metadata = SharedAttentionMetadata(
             input_positions=attn_pos,

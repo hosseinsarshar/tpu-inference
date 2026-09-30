@@ -44,11 +44,7 @@ if TYPE_CHECKING:
     LAYOUT_Q_PROJ_AS_NDH: bool = False
     USE_JAX_PROFILER_SERVER: bool = False
     JAX_PROFILER_SERVER_PORT: int = 9999
-    CONTINUE_DECODE_EOS_CHECK_INTERVAL: int = 16
-    CONTINUE_DECODE_AFTER_PREFILL: bool = False
-    CONTINUE_DECODE_GATE_STATS: bool = False
-    CONTINUE_DECODE_SKIP_FINISHED_ATTN: bool = False
-    CONTINUE_DECODE_SKIP_MIXED_RPA: bool = True
+    CONTINUE_DECODE_EOS_CHECK_INTERVAL: int = 1
     USE_BATCHED_RPA_KERNEL: bool = False
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     # Optional operator override for the RPA v3 kernel block sizes, one per
@@ -384,15 +380,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stop at their own EOS (the <=N-1 extra tokens are masked like a normal
     # stop), so the sampled distribution is unchanged. Default 1 = stock.
     "CONTINUE_DECODE_EOS_CHECK_INTERVAL":
-    lambda: int(os.getenv("CONTINUE_DECODE_EOS_CHECK_INTERVAL") or "16"),
-    "CONTINUE_DECODE_AFTER_PREFILL":
-    env_bool("CONTINUE_DECODE_AFTER_PREFILL"),
-    "CONTINUE_DECODE_GATE_STATS":
-    env_bool("CONTINUE_DECODE_GATE_STATS"),
-    "CONTINUE_DECODE_SKIP_FINISHED_ATTN":
-    env_bool("CONTINUE_DECODE_SKIP_FINISHED_ATTN", default=False),
-    "CONTINUE_DECODE_SKIP_MIXED_RPA":
-    env_bool("CONTINUE_DECODE_SKIP_MIXED_RPA", default=True),
+    lambda: int(os.getenv("CONTINUE_DECODE_EOS_CHECK_INTERVAL") or "1"),
     "USE_BATCHED_RPA_KERNEL":
     env_bool("USE_BATCHED_RPA_KERNEL"),
     "USE_BATCHED_RPA_SEQ_ON_LANE":
