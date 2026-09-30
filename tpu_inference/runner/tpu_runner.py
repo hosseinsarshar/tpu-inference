@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import functools
 import logging
 import random
@@ -237,26 +238,24 @@ def _process_continue_decode_outputs(
     step entries. Optionally updates input_batch, scheduler_output, and
     attn_metadata for synchronous runs.
     """
-    generated_tokens_cpu, actual_steps_cpu = common_utils.safe_device_get(
-        (generated_tokens, actual_steps))
-
-    all_expert_indices_cpu = None
-    if expert_indices is not None:
-        all_expert_indices_cpu = common_utils.safe_device_get(expert_indices)
-
-    lp_token_ids_cpu = None
-    lp_vals_cpu = None
-    lp_ranks_cpu = None
-    if logprobs_tensors is not None:
-        (
-            lp_token_ids_cpu,
-            lp_vals_cpu,
-            lp_ranks_cpu,
-        ) = common_utils.safe_device_get((
-            logprobs_tensors.logprob_token_ids,
-            logprobs_tensors.logprobs,
-            logprobs_tensors.selected_token_ranks,
-        ))
+    lp_ids_dev = logprobs_tensors.logprob_token_ids if logprobs_tensors is not None else None
+    lp_vals_dev = logprobs_tensors.logprobs if logprobs_tensors is not None else None
+    lp_ranks_dev = logprobs_tensors.selected_token_ranks if logprobs_tensors is not None else None
+    (
+        generated_tokens_cpu,
+        actual_steps_cpu,
+        all_expert_indices_cpu,
+        lp_token_ids_cpu,
+        lp_vals_cpu,
+        lp_ranks_cpu,
+    ) = common_utils.safe_device_get((
+        generated_tokens,
+        actual_steps,
+        expert_indices,
+        lp_ids_dev,
+        lp_vals_dev,
+        lp_ranks_dev,
+    ))
 
     actual_steps_int = int(actual_steps_cpu)
     generated_tokens_cpu = np.asarray(generated_tokens_cpu)[:actual_steps_int]
@@ -859,6 +858,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             "max_decode_steps", DEFAULT_MAX_DECODE_STEPS)
         self.eos_token_id = runner_utils.get_eos_token_id(self.model_config)
         self.pad_token_id = runner_utils.get_pad_token_id(self.model_config)
+        self._cd_chain_pending = False
+        self._cd_chain_next_tokens: jax.Array | None = None
+        self._max_decode_steps_arrays: dict[int, jax.Array] = {}
+        self._scalar_sharding = NamedSharding(self.mesh, PartitionSpec())
 
     def _init_random(self):
         if self.model_config.seed is None:
@@ -1085,6 +1088,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             self.dp_size,
             padding_gap=envs.VLLM_TPU_BUCKET_PADDING_GAP,
             additional_sizes=additional_sizes)
+        if self.dp_size > 1 and scheduler_config.max_num_seqs <= 32:
+            self.num_tokens_paddings = sorted({
+                max(16 * self.dp_size, self.max_num_reqs),
+                self.num_tokens_paddings[-1],
+            })
         self.num_tokens_paddings_per_dp = [
             padding // self.dp_size for padding in self.num_tokens_paddings
         ]
@@ -1127,7 +1135,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # Used to initialize positions / context_lens / seq_lens
         # Keep in int64 to avoid overflow with long context
         self.arange_cpu = np.arange(self.max_num_tokens, dtype=np.int64)
-        min_num_reqs = max(MIN_NUM_SEQS, next_power_of_2(self.dp_size))
+        min_num_reqs = max(MIN_NUM_SEQS * self.dp_size,
+                           next_power_of_2(self.dp_size))
         self.num_reqs_paddings = runner_utils.get_req_paddings(
             min_req_size=min_num_reqs, max_req_size=self.max_num_reqs)
 
@@ -1452,12 +1461,17 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     logits,
                     arange,
                 )
-            return self._sample_from_logits(
+            output = self._sample_from_logits(
                 scheduler_output, attn_metadata, sampling_metadata, input_ids,
                 hidden_states, logits, aux_hidden_states, spec_decode_metadata,
                 kv_connector_output, logits_indices_selector, padded_num_reqs,
                 expert_indices, full_hidden_states, full_logits, req_ids_dp,
                 padded_num_scheduled_tokens_per_dp_rank)
+            if self._cd_chain_pending:
+                self._cd_chain_pending = False
+                output = self._continue_decode_after_prefill(
+                    scheduler_output, output)
+            return output
 
     def _modify_prev_results(self):
         # If copy to host has not been done, we just wait.
@@ -1639,6 +1653,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         # Check if the entire batch is in the decode phase.
         # request_distribution[0] tracks the number of decode requests.
+        self._cd_chain_pending = False
         is_decode_only = self.input_batch.request_distribution[
             0] == self.input_batch.num_reqs
         has_structured_output = getattr(scheduler_output,
@@ -1647,6 +1662,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if (is_decode_only and self.enable_continue_decode
                 and not has_structured_output):
             return self._execute_continue_decode(scheduler_output)
+
+        if self.enable_continue_decode:
+            self._cd_chain_pending = (
+                self._can_chain_continue_decode()
+                and self._will_be_decode_only(scheduler_output))
 
         # TODO(pooyam): I guess we can remove returning sampling_metadata in `_prepare_inputs` after https://github.com/njhill/vllm/commit/b7433ca1a47732394b1bdea4099d98389515954b
         (
@@ -1809,6 +1829,189 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         )
         return None
 
+    def _will_be_decode_only(self, scheduler_output: "VllmSchedulerOutput"
+                             ) -> bool:
+        if scheduler_output.scheduled_spec_decode_tokens:
+            return False
+        num_reqs = self.input_batch.num_reqs
+        num_scheduled = scheduler_output.num_scheduled_tokens
+        computed = self.input_batch.num_computed_tokens_cpu
+        prompt_lens = self.input_batch.num_prompt_tokens
+        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            n = num_scheduled[req_id]
+            if n == 1:
+                continue
+            if computed[i] + n < prompt_lens[i]:
+                return False
+        return True
+
+    def _can_chain_continue_decode(self) -> bool:
+        return (self.enable_continue_decode
+                and self.static_max_decode_steps > 1
+                and not self.scheduler_config.async_scheduling
+                and self.speculative_config is None
+                and not self.is_multimodal_model and not self.is_pooling_model
+                and not self.input_batch.num_prompt_logprobs
+                and self.vllm_config.sharding_config.prefill_cp_size <= 1
+                and self.aux_output_worker is None)
+
+    def _continue_decode_after_prefill(
+        self,
+        scheduler_output: "VllmSchedulerOutput",
+        output: ModelRunnerOutput,
+    ) -> ModelRunnerOutput:
+        next_tokens = self._cd_chain_next_tokens
+        self._cd_chain_next_tokens = None
+        if next_tokens is None:
+            return output
+
+        num_reqs = self.input_batch.num_reqs
+        req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
+
+        max_decode_steps = min(self.static_max_decode_steps - 1,
+                               self._get_min_remaining_slots())
+        if max_decode_steps <= 0:
+            return output
+
+        computed = self.input_batch.num_computed_tokens_cpu
+        saved_computed = computed[:num_reqs].copy()
+        saved_distribution = self.input_batch.request_distribution
+        for i, req_id in enumerate(req_ids):
+            computed[i] += scheduler_output.num_scheduled_tokens[req_id]
+        self.input_batch.request_distribution = [num_reqs, num_reqs, num_reqs]
+        decode_sched = copy.copy(scheduler_output)
+        decode_sched.num_scheduled_tokens = dict.fromkeys(req_ids, 1)
+        decode_sched.total_num_scheduled_tokens = num_reqs
+        decode_sched.scheduled_spec_decode_tokens = {}
+        try:
+            (input_ids, _, attn_metadata, sampling_metadata, logits_indices, _,
+             _, _, _, _, tokens_indices_selector,
+             _) = self._prepare_inputs(decode_sched)
+        finally:
+            computed[:num_reqs] = saved_computed
+            self.input_batch.request_distribution = saved_distribution
+
+        # The sampler returns replicated tokens, but the precompiled loop
+        # expects the DP-sharded decode layout. Match it to avoid a recompile.
+        if next_tokens.sharding != input_ids.sharding:
+            next_tokens = jax.device_put(next_tokens, input_ids.sharding)
+        assert next_tokens.shape == input_ids.shape, (
+            f"sampled tokens {next_tokens.shape} do not match the decode "
+            f"input layout {input_ids.shape}")
+        active_mask = _compute_active_mask(logits_indices, self.dp_size,
+                                           input_ids.shape[0] // self.dp_size)
+        init_state = TpuSamplingState(
+            current_tokens=next_tokens,
+            active_mask=active_mask,
+            attn_metadata=attn_metadata,
+            step_counter=self.zero_array,
+        )
+
+        from tpu_inference.layers.jax.sample.sampling import sample
+
+        max_steps_arr = self._max_decode_steps_arrays.get(max_decode_steps)
+        if max_steps_arr is None:
+            max_steps_arr = jax.device_put(
+                np.array(max_decode_steps, dtype=np.int32),
+                self._scalar_sharding)
+            self._max_decode_steps_arrays[max_decode_steps] = max_steps_arr
+
+        with self.maybe_forbid_compile, \
+             set_forward_context(None, self.vllm_config):
+            (generated_tokens, final_kv_caches, final_state, final_rng, _,
+             logprobs_tensors) = continue_decode(
+                 state=self.state_leaves,
+                 model_fn=self.model.step_fn_no_options,
+                 compute_logits_fn=self.compute_logits_fn,
+                 sample_fn=sample,
+                 mesh=self.mesh,
+                 sampling_metadata=sampling_metadata,
+                 init_state=init_state,
+                 kv_caches=self.kv_caches,
+                 max_decode_steps=max_steps_arr,
+                 static_max_decode_steps=self.static_max_decode_steps,
+                 eos_token_id=self.eos_token_id,
+                 padding_token_id=self.pad_token_id,
+                 rng=self.rng_params_for_sampling,
+                 inputs_embeds=None,
+                 layer_name_to_kvcache_index=tuple(
+                     self.layer_name_to_kvcache_index.items()),
+                 lora_metadata=self.lora_utils.extract_lora_metadata(),
+                 intermediate_tensors=None,
+                 is_first_rank=self.is_first_rank,
+                 is_last_rank=self.is_last_rank,
+                 dp_size=self.dp_size,
+                 collect_expert_indices=False,
+                 max_logprobs=self.model_config.max_logprobs,
+                 logprobs_mode=self.model_config.logprobs_mode,
+                 continue_decode_eos_check_interval=self.
+                 continue_decode_eos_check_interval,
+             )
+
+        self.rng_params_for_sampling = final_rng
+        self.kv_caches = final_kv_caches
+
+        (
+            continued_token_ids,
+            continued_logprobs,
+            _,
+            _,
+            _,
+        ) = _process_continue_decode_outputs(
+            generated_tokens=generated_tokens,
+            actual_steps=final_state.step_counter,
+            req_ids=req_ids,
+            eos_token_id=self.eos_token_id,
+            indices_selector=tokens_indices_selector,
+            logprobs_tensors=logprobs_tensors,
+            requests=self.requests,
+            input_batch=self.input_batch,
+            max_num_reqs=self.max_num_reqs,
+            max_model_len=self.max_model_len,
+            attn_metadata=attn_metadata,
+        )
+
+        sampled = output.sampled_token_ids
+        init_lens = [len(s) for s in sampled]
+        for i, extra in enumerate(continued_token_ids):
+            if extra and i < len(sampled) and sampled[i]:
+                sampled[i].extend(extra)
+
+        if output.logprobs is not None and continued_logprobs is not None:
+            init_lp = output.logprobs
+            cont_lp = continued_logprobs
+            merged_ids = []
+            merged_vals = []
+            merged_ranks = []
+            for i, init_len in enumerate(init_lens):
+                p_start = (init_lp.cu_num_generated_tokens[i]
+                           if init_lp.cu_num_generated_tokens is not None else i)
+                p_end = p_start + init_len
+                if p_end > p_start:
+                    merged_ids.append(init_lp.logprob_token_ids[p_start:p_end])
+                    merged_vals.append(init_lp.logprobs[p_start:p_end])
+                    merged_ranks.append(
+                        init_lp.sampled_token_ranks[p_start:p_end])
+                extra_len = len(sampled[i]) - init_len
+                if extra_len > 0:
+                    c_start = (
+                        cont_lp.cu_num_generated_tokens[i]
+                        if cont_lp.cu_num_generated_tokens is not None else i)
+                    c_end = c_start + extra_len
+                    merged_ids.append(cont_lp.logprob_token_ids[c_start:c_end])
+                    merged_vals.append(cont_lp.logprobs[c_start:c_end])
+                    merged_ranks.append(
+                        cont_lp.sampled_token_ranks[c_start:c_end])
+            if merged_ids:
+                output.logprobs = LogprobsLists(
+                    logprob_token_ids=np.concatenate(merged_ids, axis=0),
+                    logprobs=np.concatenate(merged_vals, axis=0),
+                    sampled_token_ranks=np.concatenate(merged_ranks, axis=0),
+                    cu_num_generated_tokens=[0] +
+                    list(np.cumsum([len(x) for x in sampled])),
+                )
+        return output
+
     def _get_min_remaining_slots(self) -> int:
         # Conservatively calculate the minimum remaining token capacity based on max_model_len.
         num_tokens = self.input_batch.num_tokens[:self.input_batch.num_reqs]
@@ -1861,7 +2064,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         max_decode_steps = min(self.static_max_decode_steps, min_remaining)
         if max_decode_steps <= 0:
             max_decode_steps = 1
-        max_decode_steps_arr = jnp.array(max_decode_steps, dtype=jnp.int32)
+        max_decode_steps_arr = self._max_decode_steps_arrays.get(
+            max_decode_steps)
+        if max_decode_steps_arr is None:
+            max_decode_steps_arr = jax.device_put(
+                np.array(max_decode_steps, dtype=np.int32),
+                self._scalar_sharding)
+            self._max_decode_steps_arrays[
+                max_decode_steps] = max_decode_steps_arr
 
         lora_metadata = self.lora_utils.extract_lora_metadata()
 
@@ -2113,6 +2323,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 sampling_metadata=tpu_sampling_metadata,
                 key=rejection_rng,
             )
+
+        if self._cd_chain_pending:
+            self._cd_chain_next_tokens = next_tokens
 
         logits = logits.astype(jnp.float32)
         if full_logits is not None:

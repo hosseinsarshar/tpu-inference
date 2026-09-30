@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect as _cd_inspect
+
 DEFAULT_MAX_DECODE_STEPS = 10
 
 
@@ -36,16 +38,26 @@ def patch_vllm_scheduler_for_continue_decode():
     if not getattr(Scheduler, "_continue_decode_patched", False):
         original_update_base = Scheduler._update_request_with_output
 
+        # vLLM 0.23.1rc1.dev1414 (the pin in post-training:sep-03) has no
+        # `is_stale` parameter on _update_request_with_output; newer vLLM does.
+        # Resolve once here rather than try/except per token.
+        try:
+            _cd_orig_takes_is_stale = "is_stale" in _cd_inspect.signature(
+                original_update_base).parameters
+        except (TypeError, ValueError):
+            _cd_orig_takes_is_stale = False
+
         def patched_update_base(scheduler_self,
                                 request,
                                 new_token_ids,
                                 is_stale=False,
                                 **kwargs):
             # Original update appends new_token_ids to request output and trims on stop token.
+            if _cd_orig_takes_is_stale:
+                kwargs["is_stale"] = is_stale
             res_token_ids, stopped = original_update_base(scheduler_self,
                                                           request,
                                                           new_token_ids,
-                                                          is_stale=is_stale,
                                                           **kwargs)
 
             # schedule() only incremented num_computed_tokens by 1. Advance by the remaining
@@ -86,6 +98,12 @@ def patch_vllm_scheduler_for_continue_decode():
     if not getattr(AsyncScheduler, "_continue_decode_patched", False):
         original_async_update_req = AsyncScheduler._update_request_with_output
 
+        try:
+            _cd_async_takes_is_stale = "is_stale" in _cd_inspect.signature(
+                original_async_update_req).parameters
+        except (TypeError, ValueError):
+            _cd_async_takes_is_stale = False
+
         def patched_async_update_request_with_output(scheduler_self,
                                                      request,
                                                      new_token_ids,
@@ -104,10 +122,11 @@ def patch_vllm_scheduler_for_continue_decode():
             # instance flag for the duration of this call.
             scheduler_self._cd_stale_in_flight = is_stale
             try:
+                if _cd_async_takes_is_stale:
+                    kwargs["is_stale"] = is_stale
                 return original_async_update_req(scheduler_self,
                                                  request,
                                                  new_token_ids,
-                                                 is_stale=is_stale,
                                                  **kwargs)
             finally:
                 scheduler_self._cd_stale_in_flight = False

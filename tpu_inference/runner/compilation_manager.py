@@ -2061,90 +2061,114 @@ class CompilationManager:
             )
 
             lora_metadata = self.runner.lora_utils.extract_lora_metadata()
+            scalar_sharding = NamedSharding(self.runner.mesh, PartitionSpec())
+            sampling_sharding = (scalar_sharding
+                                 if dp_size == 1 else dp_sharding)
+            max_decode_steps_arr = jax.device_put(
+                np.array(user_max_decode_steps, dtype=np.int32),
+                scalar_sharding)
 
-            # Compile once for the max steps using JAX array for dynamic bound
-            max_decode_steps_arr = jnp.array(user_max_decode_steps,
-                                             dtype=jnp.int32)
+            for do_sampling in (True, False):
+                if do_sampling:
+                    temperature = self._create_dummy_tensor(
+                        (num_reqs, ), jnp.float32, sharding=sampling_sharding)
+                    top_k = self._create_dummy_tensor(
+                        (num_reqs, ), jnp.int32, sharding=sampling_sharding)
+                    top_p = self._create_dummy_tensor(
+                        (num_reqs, ), jnp.float32, sharding=sampling_sharding)
+                else:
+                    temperature = None
+                    top_k = None
+                    top_p = None
 
-            def continue_decode_wrapper(
-                state,
-                model_fn,
-                compute_logits_fn,
-                sample_fn,
-                mesh,
-                sampling_metadata,
-                init_state,
-                kv_caches,
-                max_decode_steps,
-                static_max_decode_steps,
-                eos_token_id,
-                padding_token_id,
-                rng,
-                layer_name_to_kvcache_index,
-                lora_metadata,
-                is_first_rank,
-                is_last_rank,
-                dp_size,
-                collect_expert_indices,
-                continue_decode_eos_check_interval,
-            ):
-                (generated_tokens, final_kv_caches, final_state, final_rng,
-                 all_expert_indices, logprobs_tensors) = continue_decode(
-                     state=state,
-                     model_fn=model_fn,
-                     compute_logits_fn=compute_logits_fn,
-                     sample_fn=sample_fn,
-                     mesh=mesh,
-                     sampling_metadata=sampling_metadata,
-                     init_state=init_state,
-                     kv_caches=kv_caches,
-                     max_decode_steps=max_decode_steps,
-                     static_max_decode_steps=static_max_decode_steps,
-                     eos_token_id=eos_token_id,
-                     padding_token_id=padding_token_id,
-                     rng=rng,
-                     layer_name_to_kvcache_index=layer_name_to_kvcache_index,
-                     lora_metadata=lora_metadata,
-                     is_first_rank=is_first_rank,
-                     is_last_rank=is_last_rank,
-                     dp_size=dp_size,
-                     collect_expert_indices=collect_expert_indices,
-                     max_logprobs=self.runner.model_config.max_logprobs,
-                     logprobs_mode=self.runner.model_config.logprobs_mode,
-                     continue_decode_eos_check_interval=
-                     continue_decode_eos_check_interval,
-                 )
-                self.runner.kv_caches = final_kv_caches
-                return generated_tokens
+                sampling_metadata = TPUSupportedSamplingMetadata(
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    _cache_collision_dummy=_cache_collision_dummy,
+                    do_sampling=do_sampling,
+                    logprobs=False)
 
-            def continue_decode_warmup(_fn, _args, _call_kwargs):
-                new_args = list(_args)
-                new_args[7] = self.runner.kv_caches
-                return _fn(*new_args, **_call_kwargs)
+                def continue_decode_wrapper(
+                    state,
+                    model_fn,
+                    compute_logits_fn,
+                    sample_fn,
+                    mesh,
+                    sampling_metadata,
+                    init_state,
+                    kv_caches,
+                    max_decode_steps,
+                    static_max_decode_steps,
+                    eos_token_id,
+                    padding_token_id,
+                    rng,
+                    layer_name_to_kvcache_index,
+                    lora_metadata,
+                    is_first_rank,
+                    is_last_rank,
+                    dp_size,
+                    collect_expert_indices,
+                    continue_decode_eos_check_interval,
+                ):
+                    (generated_tokens, final_kv_caches, final_state, final_rng,
+                     all_expert_indices, logprobs_tensors) = continue_decode(
+                         state=state,
+                         model_fn=model_fn,
+                         compute_logits_fn=compute_logits_fn,
+                         sample_fn=sample_fn,
+                         mesh=mesh,
+                         sampling_metadata=sampling_metadata,
+                         init_state=init_state,
+                         kv_caches=kv_caches,
+                         max_decode_steps=max_decode_steps,
+                         static_max_decode_steps=static_max_decode_steps,
+                         eos_token_id=eos_token_id,
+                         padding_token_id=padding_token_id,
+                         rng=rng,
+                         layer_name_to_kvcache_index=
+                         layer_name_to_kvcache_index,
+                         lora_metadata=lora_metadata,
+                         is_first_rank=is_first_rank,
+                         is_last_rank=is_last_rank,
+                         dp_size=dp_size,
+                         collect_expert_indices=collect_expert_indices,
+                         max_logprobs=self.runner.model_config.max_logprobs,
+                         logprobs_mode=self.runner.model_config.logprobs_mode,
+                         continue_decode_eos_check_interval=
+                         continue_decode_eos_check_interval,
+                     )
+                    self.runner.kv_caches = final_kv_caches
+                    return generated_tokens
 
-            self._run_compilation(
-                f"worker{self.runner.rank} continue_decode_steps_{user_max_decode_steps}_reqs_{num_reqs}",
-                continue_decode_wrapper,
-                self.runner.state_leaves,
-                self.runner.model.step_fn_no_options,
-                self.runner.compute_logits_fn,
-                sample,
-                self.runner.mesh,
-                sampling_metadata,
-                init_state,
-                self.runner.kv_caches,
-                max_decode_steps_arr,
-                user_max_decode_steps,
-                self.runner.eos_token_id,
-                self.runner.pad_token_id,
-                self.runner.rng_params_for_sampling,
-                tuple(self.runner.layer_name_to_kvcache_index.items()),
-                lora_metadata,
-                self.runner.is_first_rank,
-                self.runner.is_last_rank,
-                self.runner.dp_size,
-                self.runner.vllm_config.aux_output_config.
-                enable_return_routed_experts,
-                self.runner.continue_decode_eos_check_interval,
-                warmup_handler=continue_decode_warmup,
-            )
+                def continue_decode_warmup(_fn, _args, _call_kwargs):
+                    new_args = list(_args)
+                    new_args[7] = self.runner.kv_caches
+                    return _fn(*new_args, **_call_kwargs)
+
+                self._run_compilation(
+                    f"worker{self.runner.rank} continue_decode_steps_{user_max_decode_steps}_reqs_{num_reqs}_sample_{do_sampling}",
+                    continue_decode_wrapper,
+                    self.runner.state_leaves,
+                    self.runner.model.step_fn_no_options,
+                    self.runner.compute_logits_fn,
+                    sample,
+                    self.runner.mesh,
+                    sampling_metadata,
+                    init_state,
+                    self.runner.kv_caches,
+                    max_decode_steps_arr,
+                    user_max_decode_steps,
+                    self.runner.eos_token_id,
+                    self.runner.pad_token_id,
+                    self.runner.rng_params_for_sampling,
+                    tuple(self.runner.layer_name_to_kvcache_index.items()),
+                    lora_metadata,
+                    self.runner.is_first_rank,
+                    self.runner.is_last_rank,
+                    self.runner.dp_size,
+                    getattr(self.runner.vllm_config.model_config,
+                            "enable_return_routed_experts", False),
+                    self.runner.continue_decode_eos_check_interval,
+                    warmup_handler=continue_decode_warmup,
+                )

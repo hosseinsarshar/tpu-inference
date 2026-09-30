@@ -83,47 +83,29 @@ def create_dummy_weights_on_tpu(
 
 
 def load_dummy_weights_jax(model, mesh: Mesh) -> None:
-    """Fill every nnx.Param in `model` with random TPU-resident data.
-    """
-
+    """Fill every nnx.Param in `model` with TPU-resident dummy data in a single JIT call."""
+    from flax import nnx
     t0 = time.perf_counter()
+    state = nnx.state(model)
+    pspecs = nnx.get_partition_spec(state)
 
-    for param_name, param in model.named_parameters():
-        spec = param.get_metadata().get("out_sharding", ())
+    def _to_named_sharding(spec):
         if isinstance(spec, NamedSharding):
-            spec = spec.spec
-        elif isinstance(spec, SingleDeviceSharding):
-            spec = ()
+            return NamedSharding(mesh, spec.spec)
+        if isinstance(spec, PartitionSpec):
+            return NamedSharding(mesh, spec)
+        return NamedSharding(mesh, PartitionSpec())
 
-        sharding = NamedSharding(
-            mesh, spec if isinstance(spec, PartitionSpec) else PartitionSpec())
+    out_shardings = jax.tree.map(_to_named_sharding, pspecs)
+    @partial(jax.jit, out_shardings=out_shardings)
+    def _alloc_all_dummy_params():
+        return jax.tree.map(lambda x: jnp.zeros(x.shape, dtype=x.dtype), state)
 
-        is_moe = hasattr(param, "_weights_to_load")
-        param_shape = param.value.shape
-
-        if is_moe:
-            # MoE: downstream post-loading fusion expects transposed shape
-            # (E, F, D) instead of (E, D, F).
-            num_experts, input_dim, intermediate_dim = param_shape
-            param_shape = (num_experts, intermediate_dim, input_dim)
-
-        dummy = create_dummy_weights_on_tpu(
-            sharding=sharding,
-            weight_shape=param_shape,
-            weight_dtype=param.value.dtype,
-        )
-
-        if is_moe:
-            param._weights_to_load[:] = jnp.vsplit(
-                dummy, indices_or_sections=num_experts)
-
-        assign_and_shard_param(param, dummy, param_name)
-
-    # Post-process (quantisation etc.) per-module.
+    dummy_state = _alloc_all_dummy_params()
+    nnx.update(model, dummy_state)
     _process_weights_after_loading_jax(model)
-
     logger.info(
-        "Pathways dummy weight loading (jax) took %.2fs",
+        "Pathways single-JIT dummy weight loading (jax) took %.2fs",
         time.perf_counter() - t0,
     )
 
