@@ -260,8 +260,11 @@ def _decode_core_impl(
 
     def cond_fn(carry):
         i = carry[0]
+        am = carry[2]
         eos_flag = carry[-1]
-        not_done = i < max_decode_steps
+        # Stop once no row on any DP rank is still active. Under SPMD DP the
+        # mask is sharded, so this is one small all-reduce per step.
+        not_done = jnp.logical_and(i < max_decode_steps, jnp.any(am))
         if continue_decode_eos_check_interval <= 0:
             return not_done
         should_check_eos = (i % continue_decode_eos_check_interval == 0)

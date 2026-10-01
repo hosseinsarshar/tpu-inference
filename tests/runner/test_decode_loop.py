@@ -390,15 +390,14 @@ def test_continue_decode_no_exit_on_eos():
         continue_decode_eos_check_interval=-1,
     )
 
-    # Verify loop ran all 5 steps despite EOS hit
-    assert int(final_state.step_counter) == 5
+    # The first EOS does not stop the loop; it stops once both rows are done.
+    assert int(final_state.step_counter) == 3
 
     # Expected tokens:
     # Step 0: [42, 43]
     # Step 1: [44, 99] (req 1 hits EOS)
     # Step 2: [99, -1] (req 0 hits EOS; req 1 inactive -> -1)
-    # Step 3: [-1, -1] (both inactive)
-    # Step 4: [-1, -1] (both inactive)
+    # Steps 3-4: not run; the buffer keeps its padding.
     expected_tokens = np.array(
         [
             [42, 43],
@@ -500,13 +499,12 @@ def _lower_decode_core(continue_decode_eos_check_interval):
 
 
 def test_continue_decode_no_exit_on_eos_drops_eos_reduction():
-    """With the EOS check disabled, the compiled loop body must not reduce
-    the per-request EOS hits: cond_fn never reads the flag, so the carried
-    value is left untouched and the reduction (a cross-DP all-reduce on every
-    decode step in the multi-device program) is dead code.
-    """
-    assert "reduce_or" in _lower_decode_core(1)
-    assert "reduce_or" not in _lower_decode_core(-1)
+    """With the EOS check disabled, the per-request EOS reduction is dead code;
+    only the all-done check on the active mask remains."""
+    with_eos_check = _lower_decode_core(1).count("reduce_or")
+    without_eos_check = _lower_decode_core(-1).count("reduce_or")
+    assert without_eos_check >= 1
+    assert with_eos_check > without_eos_check
 
 
 def test_continue_decode_exit_on_eos_interval():
