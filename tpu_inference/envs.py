@@ -92,6 +92,8 @@ if TYPE_CHECKING:
     VERIFY_WEIGHTS: bool = False
     SAMPLING_MICROBATCH_SIZE: int = 0
     DISTRIBUTED_SAMPLING_MAX_TOP_K: int = 64
+    DISTRIBUTED_SAMPLING_TOPK_CHUNK: int = -1
+    DISTRIBUTED_SAMPLING_SORTED_TOPP: bool = True
     RAIDEN_H2D_SETTLE: bool = True
 
 
@@ -567,6 +569,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # read at trace time so candidate tensor shapes remain static.
     "DISTRIBUTED_SAMPLING_MAX_TOP_K":
     lambda: int(os.getenv("DISTRIBUTED_SAMPLING_MAX_TOP_K", "64")),
+    "DISTRIBUTED_SAMPLING_TOPK_CHUNK":
+    lambda: int(os.getenv("DISTRIBUTED_SAMPLING_TOPK_CHUNK", "-1")),
+    "DISTRIBUTED_SAMPLING_SORTED_TOPP":
+    env_bool("DISTRIBUTED_SAMPLING_SORTED_TOPP", default=True),
     # RL weight sync: wait for the async Raiden H2D DMA to settle before
     # letting the rollout resume. See RaidenWorkerSync._wait_until_settled.
     "RAIDEN_H2D_SETTLE":

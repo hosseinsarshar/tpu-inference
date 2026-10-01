@@ -98,7 +98,7 @@ def _decode_core_impl(
     *,
     state,
     kv_caches,
-    step_rngs,
+    rng,
     sampling_metadata,
     inputs_embeds,
     lora_metadata,
@@ -131,6 +131,10 @@ def _decode_core_impl(
     logprobs_mode,
     continue_decode_eos_check_interval: int = 1,
 ):
+    # Split the per-step keys inside this jit instead of in a separate
+    # dispatch before every window. Same keys as `_split_rngs`.
+    all_rngs = jax.random.split(rng, static_max_decode_steps + 1)
+    step_rngs = all_rngs[:static_max_decode_steps]
     has_logprobs = False if sampling_metadata is None else sampling_metadata.logprobs
     from tpu_inference.layers.jax.sample.sampling import \
         distributed_sampling_allowed
@@ -260,8 +264,11 @@ def _decode_core_impl(
 
     def cond_fn(carry):
         i = carry[0]
+        am = carry[2]
         eos_flag = carry[-1]
-        not_done = i < max_decode_steps
+        # Stop once no row on any DP rank is still active. Under SPMD DP the
+        # mask is sharded, so this is one small all-reduce per step.
+        not_done = jnp.logical_and(i < max_decode_steps, jnp.any(am))
         if continue_decode_eos_check_interval <= 0:
             return not_done
         should_check_eos = (i % continue_decode_eos_check_interval == 0)
@@ -315,7 +322,7 @@ def _decode_core_impl(
 
     return (step_idx_final, current_tokens, active_mask, positions, seq_lens,
             kv_caches, token_buffer, expert_buffer, lp_ids_buffer,
-            lp_val_buffer, lp_ranks_buffer)
+            lp_val_buffer, lp_ranks_buffer, all_rngs[max_decode_steps])
 
 
 @functools.lru_cache(maxsize=1)
@@ -440,9 +447,6 @@ def continue_decode(
     seq_lens_size = init_state.attn_metadata.seq_lens.shape[0]
     pad_len = (seq_lens_size - batch_size) // dp_size
 
-    step_rngs, current_rng = _split_rngs(rng, static_max_decode_steps,
-                                         max_decode_steps)
-
     attn = init_state.attn_metadata
 
     # Discover the per-step expert-indices shape without executing a step.
@@ -499,10 +503,10 @@ def continue_decode(
 
     (step_counter, current_tokens, active_mask, positions, seq_lens, kv_caches,
      token_buffer, expert_buffer, lp_ids_buffer, lp_val_buffer,
-     lp_ranks_buffer) = _get_decode_core()(
+     lp_ranks_buffer, current_rng) = _get_decode_core()(
          state=state,
          kv_caches=kv_caches,
-         step_rngs=step_rngs,
+         rng=rng,
          sampling_metadata=sampling_metadata,
          inputs_embeds=inputs_embeds,
          lora_metadata=lora_metadata,
