@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -76,8 +77,12 @@ class TPUSupportedSamplingMetadata:
 
         # Use a dummy tensor with a unique shape for each logprobs config.
         # This avoids persistent cache collisions.
-        cache_collision_dummy = _cached_collision_dummy(
-            mesh, 1 if needs_logprobs else 2)
+        if os.environ.get("ABL_NO_SAMPLING_META_CACHE", "0") == "1":
+            cache_collision_dummy = _cached_collision_dummy.__wrapped__(
+                mesh, 1 if needs_logprobs else 2)
+        else:
+            cache_collision_dummy = _cached_collision_dummy(
+                mesh, 1 if needs_logprobs else 2)
 
         if input_batch.all_greedy:
             return cls(do_sampling=False,
@@ -91,7 +96,9 @@ class TPUSupportedSamplingMetadata:
         top_p_cur = input_batch.top_p_cpu[:n]
         is_uniform = (n > 0 and np.all(temp_cur == temp_cur[0])
                       and np.all(top_k_cur == top_k_cur[0])
-                      and np.all(top_p_cur == top_p_cur[0]))
+                      and np.all(top_p_cur == top_p_cur[0])
+                      and os.environ.get("ABL_NO_SAMPLING_META_CACHE",
+                                         "0") != "1")
         if is_uniform:
             rank_counts = tuple(
                 len(req_indices_dp.get(r, ())) for r in range(dp_size))

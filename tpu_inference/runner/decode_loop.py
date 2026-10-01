@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -92,6 +93,11 @@ def _split_rngs(rng, static_size, dynamic_size):
     # is a lax.while_loop, so step keys are indexed by a *traced* step counter,
     # which requires array indexing.
     return all_rngs[:static_size], all_rngs[dynamic_size]
+
+
+def _abl(name: str) -> bool:
+    """Temporary ablation knob: ABL_<NAME>=1 turns one to_43s change off."""
+    return os.environ.get(name, "0") == "1"
 
 
 def _finished_row_attention_inputs(
@@ -194,7 +200,8 @@ def _decode_core_impl(
     # See `_finished_row_attention_inputs`. The loop carry keeps the real
     # positions and seq_lens for the host. Context-parallel meshes split each
     # sequence's KV across ranks, so they keep the plain inputs.
-    skip_finished_attn = (getattr(block_tables, "ndim", 0) >= 1
+    skip_finished_attn = (not _abl("ABL_NO_SKIP_FINISHED_ATTN")
+                          and getattr(block_tables, "ndim", 0) >= 1
                           and block_tables.size % seq_lens.shape[0] == 0
                           and mesh.shape.get("dcp", 1) == 1
                           and mesh.shape.get("pcp", 1) == 1)
@@ -217,7 +224,7 @@ def _decode_core_impl(
             mamba_state_indices=mamba_state_indices,
             # Both callers (`_execute_continue_decode` and the chained path)
             # enter the loop with a (n, n, n) distribution: one token per row.
-            decode_only=True,
+            decode_only=not _abl("ABL_NO_DECODE_ONLY_RPA"),
         )
         shared_attn_metadata = SharedAttentionMetadata(
             input_positions=attn_pos,
@@ -338,7 +345,10 @@ def _decode_core_impl(
         eos_flag = carry[-1]
         # Stop once no row on any DP rank is still active. Under SPMD DP the
         # mask is sharded, so this is one small all-reduce per step.
-        not_done = jnp.logical_and(i < max_decode_steps, jnp.any(am))
+        if os.environ.get("ABL_NO_ALLDONE_EXIT", "0") == "1":
+            not_done = i < max_decode_steps
+        else:
+            not_done = jnp.logical_and(i < max_decode_steps, jnp.any(am))
         if continue_decode_eos_check_interval <= 0:
             return not_done
         should_check_eos = (i % continue_decode_eos_check_interval == 0)

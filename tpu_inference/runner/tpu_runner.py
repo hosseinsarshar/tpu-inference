@@ -15,6 +15,7 @@
 import copy
 import functools
 import logging
+import os
 import random
 import sys
 from contextlib import nullcontext
@@ -1088,7 +1089,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             self.dp_size,
             padding_gap=envs.VLLM_TPU_BUCKET_PADDING_GAP,
             additional_sizes=additional_sizes)
-        if self.dp_size > 1 and scheduler_config.max_num_seqs <= 32:
+        if (self.dp_size > 1 and scheduler_config.max_num_seqs <= 32
+                and os.environ.get("ABL_NO_PADDING_BUCKETS", "0") != "1"):
             self.num_tokens_paddings = sorted({
                 max(16 * self.dp_size, self.max_num_reqs),
                 self.num_tokens_paddings[-1],
@@ -1137,6 +1139,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.arange_cpu = np.arange(self.max_num_tokens, dtype=np.int64)
         min_num_reqs = max(MIN_NUM_SEQS * self.dp_size,
                            next_power_of_2(self.dp_size))
+        if os.environ.get("ABL_NO_PADDING_BUCKETS", "0") == "1":
+            min_num_reqs = max(MIN_NUM_SEQS, next_power_of_2(self.dp_size))
         self.num_reqs_paddings = runner_utils.get_req_paddings(
             min_req_size=min_num_reqs, max_req_size=self.max_num_reqs)
 
@@ -1846,7 +1850,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         return True
 
     def _can_chain_continue_decode(self) -> bool:
-        return (self.enable_continue_decode
+        return (os.environ.get("ABL_NO_CD_CHAIN", "0") != "1"
+                and self.enable_continue_decode
                 and self.static_max_decode_steps > 1
                 and not self.scheduler_config.async_scheduling
                 and self.speculative_config is None
