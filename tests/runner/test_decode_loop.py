@@ -22,7 +22,7 @@ from tpu_inference.layers.common.sharding import MESH_AXIS_NAMES
 from tpu_inference.layers.jax.sample.sampling_metadata import \
     TPUSupportedSamplingMetadata
 from tpu_inference.runner.decode_loop import (TpuSamplingState,
-                                              _decode_core_impl, _split_rngs,
+                                              _decode_core_impl,
                                               _update_loop_state,
                                               continue_decode)
 
@@ -102,15 +102,72 @@ def test_update_loop_state_dp_padding():
     assert any_hit_eos
 
 
-def test_split_rngs():
+def _run_decode_core_once(rng,
+                          token,
+                          max_decode_steps=5,
+                          static_max_decode_steps=5):
+    """Runs the decode core with every row sampling `token` on every step."""
+    batch_size = 2
+
+    def mock_model_fn(state, kv_caches, current_tokens, attn_metadata, *args,
+                      **kwargs):
+        hidden_states = jnp.zeros((batch_size, 1, 1), dtype=jnp.float32)
+        return kv_caches, hidden_states, None, None
+
+    def mock_compute_logits_fn(state, hidden_states, _):
+        return jnp.zeros((batch_size, 100))
+
+    def mock_sample_fn(rng, mesh, logits, sampling_metadata, **kwargs):
+        return jnp.full((batch_size, ), token, dtype=jnp.int32), None
+
+    return _decode_core_impl(
+        state={},
+        kv_caches=[jnp.zeros((2, 10))],
+        rng=rng,
+        sampling_metadata=None,
+        inputs_embeds=None,
+        lora_metadata=None,
+        intermediate_tensors=None,
+        block_tables=jnp.zeros((2, 16), dtype=jnp.int32),
+        query_start_loc=jnp.array([0, 1, 2], dtype=jnp.int32),
+        request_distribution=jnp.array([0, 0], dtype=jnp.int32),
+        mamba_state_indices=None,
+        current_tokens=jnp.array([10, 20], dtype=jnp.int32),
+        active_mask=jnp.array([True, True], dtype=jnp.bool_),
+        input_positions=jnp.array([0, 0], dtype=jnp.int32),
+        seq_lens=jnp.array([1, 1], dtype=jnp.int32),
+        model_fn=mock_model_fn,
+        compute_logits_fn=mock_compute_logits_fn,
+        sample_fn=mock_sample_fn,
+        mesh=None,
+        max_decode_steps=max_decode_steps,
+        static_max_decode_steps=static_max_decode_steps,
+        eos_token_id=(99, ),
+        padding_token_id=-1,
+        dp_size=1,
+        pad_len=0,
+        has_experts=False,
+        expert_shape=None,
+        expert_dtype=None,
+        layer_name_to_kvcache_index=(),
+        is_first_rank=True,
+        is_last_rank=True,
+        max_logprobs=0,
+        logprobs_mode="raw",
+        continue_decode_eos_check_interval=-1,
+    )
+
+
+def test_decode_core_returns_next_rng():
+    """The core splits the rng itself and returns key `max_decode_steps`."""
     rng = jax.random.PRNGKey(42)
-    static_size = 5
-    dynamic_size = 3
-
-    step_keys, final_key = _split_rngs(rng, static_size, dynamic_size)
-
-    assert step_keys.shape[0] == static_size
-    assert final_key.shape == rng.shape
+    outputs = _run_decode_core_once(rng,
+                                    token=7,
+                                    max_decode_steps=3,
+                                    static_max_decode_steps=5)
+    assert int(outputs[0]) == 3
+    np.testing.assert_array_equal(np.asarray(outputs[-1]),
+                                  np.asarray(jax.random.split(rng, 6)[3]))
 
 
 def test_continue_decode_early_exit():
@@ -455,7 +512,6 @@ def _lower_decode_core(continue_decode_eos_check_interval):
             dtype=jnp.int32)
         return token_table[pos, jnp.arange(batch_size)], None
 
-    step_rngs, _ = _split_rngs(jax.random.PRNGKey(0), 5, 5)
     # jit directly rather than through continue_decode(): its jit carries
     # compiler_options, which JAX rejects on a nested jit under .lower().
     lowered = jax.jit(
@@ -463,7 +519,7 @@ def _lower_decode_core(continue_decode_eos_check_interval):
     ).lower(
         state={},
         kv_caches=[jnp.zeros((2, 10))],
-        step_rngs=step_rngs,
+        rng=jax.random.PRNGKey(0),
         sampling_metadata=None,
         inputs_embeds=None,
         lora_metadata=None,
@@ -626,7 +682,6 @@ def _run_decode_core_for_logprobs(logprobs_mode, raw_top, processed_top):
         next_tokens = jnp.zeros((batch_size, ), dtype=jnp.int32)
         return next_tokens, processed_logits
 
-    step_rngs, _ = _split_rngs(jax.random.PRNGKey(0), 1, 1)
     # The logprobs jits pin out_shardings=P(), so they need a mesh in context.
     # The runner always enters one (see TPUModelRunner.execute_model); mirror
     # that here instead of tracing the loop with an empty mesh.
@@ -635,7 +690,7 @@ def _run_decode_core_for_logprobs(logprobs_mode, raw_top, processed_top):
         outputs = _decode_core_impl(
             state={},
             kv_caches=[jnp.zeros((2, 10))],
-            step_rngs=step_rngs,
+            rng=jax.random.PRNGKey(0),
             sampling_metadata=TPUSupportedSamplingMetadata(logprobs=True),
             inputs_embeds=None,
             lora_metadata=None,
