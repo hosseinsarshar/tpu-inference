@@ -31,6 +31,18 @@ DEFAULT_SAMPLING_PARAMS = dict(
 )
 
 
+@functools.lru_cache(maxsize=32)
+def _cached_collision_dummy(mesh: Mesh, size: int) -> jax.Array:
+    """The compile-cache discriminator array, built once per (mesh, size)."""
+    return device_array(mesh,
+                        np.zeros((size, ), dtype=np.int32),
+                        sharding=jax.sharding.NamedSharding(
+                            mesh, jax.sharding.PartitionSpec()))
+
+
+_SAMPLING_META_CACHE: dict = {}
+
+
 @functools.partial(
     jax.tree_util.register_dataclass,
     data_fields=[
@@ -63,19 +75,37 @@ class TPUSupportedSamplingMetadata:
 
         # Use a dummy tensor with a unique shape for each logprobs config.
         # This avoids persistent cache collisions.
-        dummy_shape = (1 if needs_logprobs else 2, )
-        cache_collision_dummy = np.zeros(dummy_shape, dtype=np.int32)
-        # Use replicated sharding for dummy tensor.
-        cache_collision_dummy = device_array(
-            mesh,
-            cache_collision_dummy,
-            sharding=jax.sharding.NamedSharding(mesh,
-                                                jax.sharding.PartitionSpec()))
+        cache_collision_dummy = _cached_collision_dummy(
+            mesh, 1 if needs_logprobs else 2)
 
         if input_batch.all_greedy:
             return cls(do_sampling=False,
                        logprobs=needs_logprobs,
                        _cache_collision_dummy=cache_collision_dummy)
+
+        dp_size = len(req_indices_dp)
+        n = input_batch.num_reqs
+        temp_cur = input_batch.temperature_cpu[:n]
+        top_k_cur = input_batch.top_k_cpu[:n]
+        top_p_cur = input_batch.top_p_cpu[:n]
+        is_uniform = (n > 0 and np.all(temp_cur == temp_cur[0])
+                      and np.all(top_k_cur == top_k_cur[0])
+                      and np.all(top_p_cur == top_p_cur[0]))
+        if is_uniform:
+            rank_counts = tuple(
+                len(req_indices_dp.get(r, ())) for r in range(dp_size))
+            u_key = (
+                padded_num_reqs,
+                needs_logprobs,
+                sharding,
+                float(temp_cur[0]),
+                int(top_k_cur[0]),
+                float(top_p_cur[0]),
+                rank_counts,
+            )
+            cached_u = _SAMPLING_META_CACHE.get((mesh, "uniform"))
+            if cached_u is not None and cached_u[0] == u_key:
+                return cached_u[1]
 
         def fill_slice(cpu_tensor_np: np.ndarray,
                        fill_val: float) -> np.ndarray:
@@ -83,7 +113,6 @@ class TPUSupportedSamplingMetadata:
                                  fill_val,
                                  dtype=cpu_tensor_np.dtype)
 
-            dp_size = len(req_indices_dp)
             assert padded_num_reqs % dp_size == 0, f"padded_num_reqs ({padded_num_reqs}) must be divisible by dp_size ({dp_size})"
             padded_num_reqs_per_dp_rank = padded_num_reqs // dp_size
             for dp_rank in range(dp_size):
@@ -102,18 +131,22 @@ class TPUSupportedSamplingMetadata:
         top_p_tensor = fill_slice(input_batch.top_p_cpu,
                                   DEFAULT_SAMPLING_PARAMS["top_p"])
 
-        # Slice persistent device tensors to a fixed pre-compiled padded shape.
-        return cls(
-            temperature=device_array(mesh,
-                                     temp_tensor[:padded_num_reqs],
-                                     sharding=sharding),
-            top_p=device_array(mesh,
-                               top_p_tensor[:padded_num_reqs],
-                               sharding=sharding),
-            top_k=device_array(mesh,
-                               top_k_tensor[:padded_num_reqs],
-                               sharding=sharding),
+        # Slice persistent device tensors to a fixed pre-compiled padded shape
+        # in a single batched device_array call.
+        temperature_dev, top_p_dev, top_k_dev = device_array(
+            mesh,
+            (temp_tensor[:padded_num_reqs], top_p_tensor[:padded_num_reqs],
+             top_k_tensor[:padded_num_reqs]),
+            sharding=sharding,
+        )
+        result = cls(
+            temperature=temperature_dev,
+            top_p=top_p_dev,
+            top_k=top_k_dev,
             _cache_collision_dummy=cache_collision_dummy,
             do_sampling=not input_batch.all_greedy,
             logprobs=needs_logprobs,
         )
+        if is_uniform:
+            _SAMPLING_META_CACHE[(mesh, "uniform")] = (u_key, result)
+        return result

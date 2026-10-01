@@ -379,3 +379,33 @@ def test_from_input_batch_sampling_with_logprobs(mesh: Mesh):
 
     assert metadata.do_sampling, "do_sampling should be True"
     assert metadata.logprobs, "logprobs should be True"
+
+
+def test_from_input_batch_reuses_uniform_metadata(mesh: Mesh):
+    """A batch whose requests all share one sampling config reuses the device
+    arrays from the previous identical call; any change rebuilds them."""
+
+    def make_batch(temperature):
+        return MockInputBatch(
+            all_greedy=False,
+            num_reqs=2,
+            temperature_cpu=np.array([temperature, temperature, 0.0, 0.0],
+                                     dtype=np.float32),
+            top_k_cpu=np.array([20, 20, 0, 0], dtype=np.int32),
+            top_p_cpu=np.array([0.95, 0.95, 0.0, 0.0], dtype=np.float32),
+        )
+
+    kwargs = dict(mesh=mesh, padded_num_reqs=4, req_indices_dp={0: [0, 1]})
+    first = TPUSupportedSamplingMetadata.from_input_batch(
+        input_batch=make_batch(0.8), **kwargs)
+    second = TPUSupportedSamplingMetadata.from_input_batch(
+        input_batch=make_batch(0.8), **kwargs)
+    assert second is first
+
+    changed = TPUSupportedSamplingMetadata.from_input_batch(
+        input_batch=make_batch(0.6), **kwargs)
+    assert changed is not first
+    np.testing.assert_allclose(np.asarray(changed.temperature), [
+        0.6, 0.6, DEFAULT_SAMPLING_PARAMS["temperature"],
+        DEFAULT_SAMPLING_PARAMS["temperature"]
+    ])
