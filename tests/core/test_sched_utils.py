@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import random
 from unittest import mock
 
 import pytest
@@ -131,3 +132,110 @@ class TestContinueDecodeSchedulerPatch:
             assert request.num_computed_tokens == 10
             # The flag must not leak past the call.
             assert scheduler._cd_stale_in_flight is False
+
+
+_EOS = 151645
+_EOS2 = 151643
+
+
+def _real_request(prompt_len, max_tokens, stop_token_ids, ignore_eos):
+    """A vLLM Request whose sampling params went through the same EOS setup
+    as a served request (primary EOS plus the generation-config EOS ids)."""
+    from vllm import SamplingParams
+    from vllm.v1.request import Request
+
+    params = SamplingParams(max_tokens=max_tokens,
+                            stop_token_ids=stop_token_ids,
+                            ignore_eos=ignore_eos)
+    params.update_from_generation_config({"eos_token_id": [_EOS, _EOS2]},
+                                         eos_token_id=_EOS)
+    return Request(request_id="r",
+                   prompt_token_ids=list(range(prompt_len)),
+                   sampling_params=params,
+                   pooling_params=None)
+
+
+def _random_tokens(rng, n):
+    # Mostly ordinary tokens, with EOS, the second EOS id and the stop id 7
+    # at random positions.
+    special = [3, 7, _EOS, _EOS2]
+    return [
+        rng.choice(special) if rng.random() < 0.02 else rng.randint(10, 1000)
+        for _ in range(n)
+    ]
+
+
+class TestContinueDecodeBulkAppend:
+
+    @pytest.mark.parametrize("seed", range(8))
+    def test_matches_per_token_update(self, seed):
+        """Appending the leading tokens in one call must leave the request
+        exactly as vLLM's per-token update (check_stop() per token) does."""
+        from vllm.v1.core.sched.scheduler import Scheduler
+        original = Scheduler._update_request_with_output
+        patch_vllm_scheduler_for_continue_decode()
+        patched = Scheduler._update_request_with_output
+
+        rng = random.Random(seed)
+        scheduler = _make_scheduler(Scheduler)
+        for _ in range(200):
+            scheduler.max_model_len = rng.choice([48, 300, 100000])
+            kwargs = dict(prompt_len=rng.randint(1, 40),
+                          max_tokens=rng.choice([1, 2, 37, 300, 5000]),
+                          stop_token_ids=rng.choice([None, [], [7],
+                                                     [7, _EOS]]),
+                          ignore_eos=rng.random() < 0.3)
+            want, got = _real_request(**kwargs), _real_request(**kwargs)
+            # A few consecutive continue-decode steps on the same request.
+            for _ in range(3):
+                if want.is_finished():
+                    break
+                tokens = _random_tokens(rng, rng.choice([1, 2, 64, 256]))
+                computed = got.num_computed_tokens
+                want_ids, want_stopped = original(scheduler, want,
+                                                  list(tokens))
+                got_ids, got_stopped = patched(scheduler, got, list(tokens))
+                assert got_ids == want_ids
+                assert got_stopped == want_stopped
+                assert list(got.output_token_ids) == list(
+                    want.output_token_ids)
+                assert list(got.all_token_ids) == list(want.all_token_ids)
+                assert got.status == want.status
+                assert got.stop_reason == want.stop_reason
+                assert got.num_computed_tokens == computed + max(
+                    len(want_ids) - 1, 0)
+                want.num_computed_tokens = got.num_computed_tokens
+
+    def test_check_stop_runs_only_from_first_possible_stop(self):
+        patch_vllm_scheduler_for_continue_decode()
+        from vllm.v1.core.sched import scheduler as scheduler_module
+        Scheduler = scheduler_module.Scheduler
+        scheduler = _make_scheduler(Scheduler)
+        scheduler.max_model_len = 100000
+        real_check_stop = scheduler_module.check_stop
+
+        def run(tokens, **kwargs):
+            request = _real_request(prompt_len=8,
+                                    max_tokens=5000,
+                                    stop_token_ids=None,
+                                    ignore_eos=False)
+            for key, value in kwargs.items():
+                setattr(request.sampling_params, key, value)
+            with mock.patch.object(scheduler_module,
+                                   "check_stop",
+                                   side_effect=real_check_stop) as check:
+                ids, stopped = Scheduler._update_request_with_output(
+                    scheduler, request, list(tokens))
+            return ids, stopped, check.call_count
+
+        tokens = list(range(10, 1034))
+        # No stop token and far from the limits: no per-token checks at all.
+        assert run(tokens) == (tokens, False, 0)
+        # EOS at index 500: one check, on the EOS token, which stops.
+        tokens[500] = _EOS
+        assert run(tokens) == (tokens[:501], True, 1)
+        # Repetition detection keeps the per-token path.
+        with mock.patch("vllm.v1.core.sched.utils.check_sequence_repetition",
+                        return_value=False):
+            assert run(tokens,
+                       repetition_detection=mock.sentinel.rd)[2] == 501
