@@ -15,6 +15,33 @@
 DEFAULT_MAX_DECODE_STEPS = 10
 
 
+def _num_tokens_before_possible_stop(request, new_token_ids,
+                                     max_model_len) -> int:
+    """Returns how many leading new_token_ids cannot stop the request.
+
+    vLLM's check_stop() can only stop a request on its EOS token, a stop token
+    id, the max_tokens / max_model_len limits, or repetition detection. Returns
+    0 when repetition detection is on, so every token takes the per-token path.
+    """
+    params = request.sampling_params
+    if (len(new_token_ids) < 2 or params is None
+            or getattr(params, "repetition_detection", None) is not None):
+        return 0
+    # check_stop() runs after each append, so the token that reaches a length
+    # limit is the first one that can stop on length.
+    limit = min(len(new_token_ids), max_model_len - request.num_tokens - 1)
+    if request.max_tokens is not None:
+        limit = min(limit, request.max_tokens - request.num_output_tokens - 1)
+    for stop_id in {params.eos_token_id, *(params.stop_token_ids or ())}:
+        if stop_id is None or limit <= 0:
+            continue
+        try:
+            limit = new_token_ids.index(stop_id, 0, limit)
+        except ValueError:
+            pass
+    return max(limit, 0)
+
+
 def patch_vllm_scheduler_for_continue_decode():
     """Monkeypatches vLLM's Scheduler and AsyncScheduler for Continue Decode.
 
@@ -42,11 +69,29 @@ def patch_vllm_scheduler_for_continue_decode():
                                 is_stale=False,
                                 **kwargs):
             # Original update appends new_token_ids to request output and trims on stop token.
-            res_token_ids, stopped = original_update_base(scheduler_self,
-                                                          request,
-                                                          new_token_ids,
-                                                          is_stale=is_stale,
-                                                          **kwargs)
+            # It runs check_stop() once per token, and a continue-decode step
+            # returns up to max_decode_steps tokens per request. Append the
+            # leading tokens that cannot stop the request in one call; the
+            # original still checks the rest (usually just the stop token).
+            num_safe = _num_tokens_before_possible_stop(
+                request, new_token_ids, scheduler_self.max_model_len)
+            if num_safe:
+                request.append_output_token_ids(new_token_ids[:num_safe])
+                tail_token_ids, stopped = original_update_base(
+                    scheduler_self,
+                    request,
+                    new_token_ids[num_safe:],
+                    is_stale=is_stale,
+                    **kwargs)
+                del new_token_ids[num_safe + len(tail_token_ids):]
+                res_token_ids = new_token_ids
+            else:
+                res_token_ids, stopped = original_update_base(
+                    scheduler_self,
+                    request,
+                    new_token_ids,
+                    is_stale=is_stale,
+                    **kwargs)
 
             # schedule() only incremented num_computed_tokens by 1. Advance by the remaining
             # (N - 1) tokens generated on-device so host-side num_computed_tokens is accurate.
