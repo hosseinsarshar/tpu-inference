@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
 from unittest import mock
 
 # /home/pooyam/tpu_inference/tests/models/jax/layers/test_sampling.py
@@ -28,7 +29,7 @@ from tpu_inference.layers.jax.sample.sampling import (
     PromptLogprobsAsyncData, PromptLogprobsReqSnap, _apply_sampling_transforms,
     _can_sample_distributed, _merge_topk_candidates, compute_logprobs,
     compute_prompt_logprobs, distributed_sampling_allowed, gather_logprobs,
-    sample)
+    sample, with_distributed_sampling_support)
 from tpu_inference.layers.jax.sample.sampling_metadata import \
     TPUSupportedSamplingMetadata
 
@@ -61,6 +62,25 @@ class TestSampling:
             logprobs=False,
         )
         assert bool(_can_sample_distributed(greedy_metadata))
+
+    def test_precomputed_distributed_support(self):
+        metadata = TPUSupportedSamplingMetadata(
+            temperature=jnp.array([0.7, 0.7], dtype=jnp.float32),
+            top_k=jnp.array([20, 20], dtype=jnp.int32),
+            top_p=jnp.array([0.9, 0.0], dtype=jnp.float32),
+            do_sampling=True,
+            logprobs=False,
+        )
+        precomputed = with_distributed_sampling_support(metadata)
+        assert not bool(precomputed.distributed_sampling_supported)
+        assert not bool(_can_sample_distributed(precomputed))
+        # A precomputed value is used as is.
+        forced = replace(metadata,
+                         distributed_sampling_supported=jnp.array(True))
+        assert bool(_can_sample_distributed(forced))
+        # Greedy-only batches have nothing to precompute.
+        greedy = TPUSupportedSamplingMetadata(do_sampling=False)
+        assert with_distributed_sampling_support(greedy) is greedy
 
     def test_distributed_candidates_match_full_vocab_filters(self):
         batch_size = 2
