@@ -132,10 +132,16 @@ def _decode_core_impl(
     continue_decode_eos_check_interval: int = 1,
 ):
     has_logprobs = False if sampling_metadata is None else sampling_metadata.logprobs
-    from tpu_inference.layers.jax.sample.sampling import \
-        distributed_sampling_allowed
+    from tpu_inference.layers.jax.sample.sampling import (
+        distributed_sampling_allowed, with_distributed_sampling_support)
     allow_distributed_sampling = distributed_sampling_allowed(
         has_logprobs, logprobs_mode)
+    if sampling_metadata is not None:
+        # The sampling params do not change inside the loop. Check once here
+        # whether every row fits the distributed candidate sampler; inside
+        # sample() that check is a cross-DP all-reduce on every decode step.
+        sampling_metadata = with_distributed_sampling_support(
+            sampling_metadata)
 
     def _run_one_step(step_idx, ct, am, pos, sl, kvc):
         step_rng = step_rngs[step_idx]
