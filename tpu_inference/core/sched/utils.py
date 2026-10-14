@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from tpu_inference import envs
+
 DEFAULT_MAX_DECODE_STEPS = 10
 
 
@@ -76,8 +78,14 @@ def patch_vllm_scheduler_for_continue_decode():
                                                      DEFAULT_MAX_DECODE_STEPS)
             # Reserve max_decode_steps - 1 lookahead tokens so KVCacheManager allocates
             # sufficient blocks for up to max_decode_steps tokens before execution on TPU.
+            # A window that runs right after prefill (ENABLE_CONTINUE_DECODE_AFTER_PREFILL)
+            # also consumes the token sampled by that step, which was not scheduled,
+            # so reserve one more slot for it.
+            num_lookahead_tokens = max_decode_steps - 1
+            if envs.ENABLE_CONTINUE_DECODE_AFTER_PREFILL:
+                num_lookahead_tokens += 1
             scheduler_self.num_lookahead_tokens = max(
-                scheduler_self.num_lookahead_tokens, max_decode_steps - 1)
+                scheduler_self.num_lookahead_tokens, num_lookahead_tokens)
 
         Scheduler.__init__ = patched_init
 

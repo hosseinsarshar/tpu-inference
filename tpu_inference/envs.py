@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     USE_JAX_PROFILER_SERVER: bool = False
     JAX_PROFILER_SERVER_PORT: int = 9999
     CONTINUE_DECODE_EOS_CHECK_INTERVAL: int = 1
+    ENABLE_CONTINUE_DECODE_AFTER_PREFILL: bool = False
     USE_BATCHED_RPA_KERNEL: bool = False
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     # Optional operator override for the RPA v3 kernel block sizes, one per
@@ -381,6 +382,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stop), so the sampled distribution is unchanged. Default 1 = stock.
     "CONTINUE_DECODE_EOS_CHECK_INTERVAL":
     lambda: int(os.getenv("CONTINUE_DECODE_EOS_CHECK_INTERVAL") or "1"),
+    # continue_decode: run the next decode window in the same engine step as
+    # the prefill that makes every request ready for decode, instead of one
+    # engine round trip later. The window has the same inputs and RNG state,
+    # so the outputs do not change, but each request's first token is only
+    # returned after the window (higher TTFT). Off by default.
+    # Rule of thumb: enable it for offline batch generation such as RL
+    # rollouts, where all requests start together and only the total time
+    # matters. It removes one round trip per prefill wave, about 0.13 s per RL
+    # step with 2,048 requests on a v7x 4x4x4 slice. Leave it off for online
+    # serving.
+    "ENABLE_CONTINUE_DECODE_AFTER_PREFILL":
+    env_bool("ENABLE_CONTINUE_DECODE_AFTER_PREFILL", default=False),
     "USE_BATCHED_RPA_KERNEL":
     env_bool("USE_BATCHED_RPA_KERNEL"),
     "USE_BATCHED_RPA_SEQ_ON_LANE":

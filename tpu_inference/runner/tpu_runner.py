@@ -361,6 +361,43 @@ def _process_continue_decode_outputs(
     return sampled_token_ids, logprobs_lists, routed_experts_entries, actual_steps_int, num_eos_hits
 
 
+def _append_window_logprobs(
+    step_logprobs: LogprobsLists,
+    window_logprobs: LogprobsLists,
+    num_reqs: int,
+) -> LogprobsLists:
+    """Appends a decode window's logprobs to a step's one row per request.
+
+    The result holds, for each request, its step row followed by its window
+    rows, which is the layout of the merged `sampled_token_ids`.
+    """
+    if step_logprobs.cu_num_generated_tokens is None:
+        step_rows = np.arange(num_reqs)
+    else:
+        step_rows = np.asarray(
+            step_logprobs.cu_num_generated_tokens[:num_reqs])
+    window_cu = np.asarray(window_logprobs.cu_num_generated_tokens)
+    # Request i's step row lands at merged_cu[i]; its window rows follow it.
+    merged_cu = np.arange(num_reqs + 1) + window_cu
+    order = np.empty(merged_cu[-1], dtype=np.int64)
+    is_step_row = np.zeros(merged_cu[-1], dtype=bool)
+    is_step_row[merged_cu[:-1]] = True
+    order[is_step_row] = np.arange(num_reqs)
+    order[~is_step_row] = num_reqs + np.arange(window_cu[-1])
+
+    def merge(step_values: np.ndarray, window_values: np.ndarray):
+        return np.concatenate([step_values[step_rows], window_values])[order]
+
+    return LogprobsLists(
+        logprob_token_ids=merge(step_logprobs.logprob_token_ids,
+                                window_logprobs.logprob_token_ids),
+        logprobs=merge(step_logprobs.logprobs, window_logprobs.logprobs),
+        sampled_token_ranks=merge(step_logprobs.sampled_token_ranks,
+                                  window_logprobs.sampled_token_ranks),
+        cu_num_generated_tokens=merged_cu.tolist(),
+    )
+
+
 class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
     """Holds asynchronous model output specifically from a TPU runner.
 
@@ -860,10 +897,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             "max_decode_steps", DEFAULT_MAX_DECODE_STEPS)
         self.eos_token_id = runner_utils.get_eos_token_id(self.model_config)
         self.pad_token_id = runner_utils.get_pad_token_id(self.model_config)
-        # Set when a step that finishes every prefill can run the decode loop
-        # right away; see `_continue_decode_after_prefill`.
-        self._cd_chain_pending = False
-        self._cd_chain_next_tokens: jax.Array | None = None
+        # See `_continue_decode_after_prefill`.
+        self.enable_continue_decode_after_prefill = (
+            self.enable_continue_decode
+            and envs.ENABLE_CONTINUE_DECODE_AFTER_PREFILL)
 
     def _init_random(self):
         if self.model_config.seed is None:
@@ -1463,8 +1500,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 kv_connector_output, logits_indices_selector, padded_num_reqs,
                 expert_indices, full_hidden_states, full_logits, req_ids_dp,
                 padded_num_scheduled_tokens_per_dp_rank)
-            if self._cd_chain_pending:
-                self._cd_chain_pending = False
+            if self._can_chain_continue_decode(scheduler_output,
+                                               grammar_output, output):
                 output = self._continue_decode_after_prefill(
                     scheduler_output, output)
             return output
@@ -1649,7 +1686,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         # Check if the entire batch is in the decode phase.
         # request_distribution[0] tracks the number of decode requests.
-        self._cd_chain_pending = False
         is_decode_only = self.input_batch.request_distribution[
             0] == self.input_batch.num_reqs
         has_structured_output = getattr(scheduler_output,
@@ -1658,11 +1694,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if (is_decode_only and self.enable_continue_decode
                 and not has_structured_output):
             return self._execute_continue_decode(scheduler_output)
-
-        if self.enable_continue_decode and not has_structured_output:
-            self._cd_chain_pending = (
-                self._can_chain_continue_decode()
-                and self._will_be_decode_only(scheduler_output))
 
         # TODO(pooyam): I guess we can remove returning sampling_metadata in `_prepare_inputs` after https://github.com/njhill/vllm/commit/b7433ca1a47732394b1bdea4099d98389515954b
         (
@@ -1825,185 +1856,85 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         )
         return None
 
-    def _will_be_decode_only(self, scheduler_output: "VllmSchedulerOutput"
-                             ) -> bool:
-        """Whether every request is in decode once this step's tokens run."""
-        if scheduler_output.scheduled_spec_decode_tokens:
-            return False
-        num_reqs = self.input_batch.num_reqs
-        num_scheduled = scheduler_output.num_scheduled_tokens
-        computed = self.input_batch.num_computed_tokens_cpu
-        prompt_lens = self.input_batch.num_prompt_tokens
-        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-            n = num_scheduled[req_id]
-            if n == 1:
-                continue
-            if computed[i] + n < prompt_lens[i]:
-                return False
-        return True
+    def _can_chain_continue_decode(
+        self,
+        scheduler_output: "VllmSchedulerOutput",
+        grammar_output: "GrammarOutput | None",
+        output: ModelRunnerOutput | AsyncTPUModelRunnerOutput,
+    ) -> bool:
+        """Whether `_continue_decode_after_prefill` can run after this step.
 
-    def _can_chain_continue_decode(self) -> bool:
-        return (self.enable_continue_decode
-                and self.static_max_decode_steps > 1
+        It needs a synchronous step after which every request is in decode:
+        each one kept its sampled token, so none is still in prefill. Features
+        whose outputs or state it does not merge turn it off: structured
+        output, spec decode, multimodal, prompt logprobs, prefill context
+        parallelism, routed experts and KV transfer.
+        """
+        if not (self.enable_continue_decode_after_prefill
                 and not self.scheduler_config.async_scheduling
+                and grammar_output is None and not getattr(
+                    scheduler_output, "has_structured_output_requests", False)
                 and self.speculative_config is None
-                and not self.is_multimodal_model and not self.is_pooling_model
+                and not self.is_multimodal_model
                 and not self.input_batch.num_prompt_logprobs
                 and self.vllm_config.sharding_config.prefill_cp_size <= 1
-                and self.aux_output_worker is None)
+                and self.aux_output_worker is None
+                and not has_kv_transfer_group()):
+            return False
+        sampled = output.sampled_token_ids
+        return (len(sampled) == self.input_batch.num_reqs
+                and all(len(tokens) == 1 for tokens in sampled))
 
     def _continue_decode_after_prefill(
         self,
         scheduler_output: "VllmSchedulerOutput",
         output: ModelRunnerOutput,
     ) -> ModelRunnerOutput:
-        """Runs the decode loop on the tokens this prefill step just sampled.
+        """Runs the next continue-decode window in this step.
 
-        Without this, the step returns, the scheduler appends one token per
-        request, and the next step enters the loop. Here the loop starts at
-        once and its tokens are appended to the step's output.
+        Without this, the step returns one token per request, the engine
+        schedules again, and the next step runs a decode window on those
+        tokens. Here the same window runs at once and its tokens are appended
+        to this step's output. This saves one engine round trip per prefill
+        wave (about 0.13 s per RL step with 2,048 requests on a v7x 4x4x4
+        slice), but each request's first token is only returned after the
+        window. The window has the same inputs and RNG state as in the next
+        step, so the outputs do not change unless the batch would change in
+        between (a request finishes on its first token, or requests join,
+        leave or get preempted). The scheduler reserves one more lookahead
+        slot when this is on (see `patch_vllm_scheduler_for_continue_decode`),
+        so the window has the KV cache room that the next step would allocate.
         """
-        next_tokens = self._cd_chain_next_tokens
-        self._cd_chain_next_tokens = None
-        if next_tokens is None:
-            return output
-
         num_reqs = self.input_batch.num_reqs
-        req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
-
-        max_decode_steps = min(self.static_max_decode_steps - 1,
-                               self._get_min_remaining_slots())
-        if max_decode_steps <= 0:
-            return output
-
-        # Build the decode inputs as if the scheduler had advanced every
-        # request by this step's tokens, then restore the batch state.
+        req_ids = self.input_batch.req_ids[:num_reqs]
+        # Show the batch as the next step would see it: every request has
+        # computed this step's tokens and has one decode token scheduled.
         computed = self.input_batch.num_computed_tokens_cpu
         saved_computed = computed[:num_reqs].copy()
         saved_distribution = self.input_batch.request_distribution
-        for i, req_id in enumerate(req_ids):
-            computed[i] += scheduler_output.num_scheduled_tokens[req_id]
-        self.input_batch.request_distribution = [num_reqs, num_reqs, num_reqs]
         decode_sched = copy.copy(scheduler_output)
         decode_sched.num_scheduled_tokens = dict.fromkeys(req_ids, 1)
         decode_sched.total_num_scheduled_tokens = num_reqs
-        decode_sched.scheduled_spec_decode_tokens = {}
         try:
-            (input_ids, _, attn_metadata, sampling_metadata, logits_indices, _,
-             _, _, _, _, tokens_indices_selector,
-             _) = self._prepare_inputs(decode_sched)
+            for i, req_id in enumerate(req_ids):
+                computed[i] += scheduler_output.num_scheduled_tokens[req_id]
+            self.input_batch.request_distribution = [
+                num_reqs, num_reqs, num_reqs
+            ]
+            self._execute_continue_decode(decode_sched)
         finally:
             computed[:num_reqs] = saved_computed
             self.input_batch.request_distribution = saved_distribution
+        window = self._continue_decode_output
+        self._continue_decode_output = None
 
-        # The sampler returns replicated tokens, but the precompiled loop
-        # expects the DP-sharded decode layout. Match it to avoid a recompile.
-        if next_tokens.sharding != input_ids.sharding:
-            next_tokens = jax.device_put(next_tokens, input_ids.sharding)
-        assert next_tokens.shape == input_ids.shape, (
-            f"sampled tokens {next_tokens.shape} do not match the decode "
-            f"input layout {input_ids.shape}")
-        active_mask = _compute_active_mask(logits_indices, self.dp_size,
-                                           input_ids.shape[0] // self.dp_size)
-        init_state = TpuSamplingState(
-            current_tokens=next_tokens,
-            active_mask=active_mask,
-            attn_metadata=attn_metadata,
-            step_counter=self.zero_array,
-        )
-
-        from tpu_inference.layers.jax.sample.sampling import sample
-
-        with self.maybe_forbid_compile, \
-             set_forward_context(None, self.vllm_config):
-            (generated_tokens, final_kv_caches, final_state, final_rng, _,
-             logprobs_tensors) = continue_decode(
-                 state=self.state_leaves,
-                 model_fn=self.model.step_fn_no_options,
-                 compute_logits_fn=self.compute_logits_fn,
-                 sample_fn=sample,
-                 mesh=self.mesh,
-                 sampling_metadata=sampling_metadata,
-                 init_state=init_state,
-                 kv_caches=self.kv_caches,
-                 max_decode_steps=jnp.array(max_decode_steps,
-                                            dtype=jnp.int32),
-                 static_max_decode_steps=self.static_max_decode_steps,
-                 eos_token_id=self.eos_token_id,
-                 padding_token_id=self.pad_token_id,
-                 rng=self.rng_params_for_sampling,
-                 inputs_embeds=None,
-                 layer_name_to_kvcache_index=tuple(
-                     self.layer_name_to_kvcache_index.items()),
-                 lora_metadata=self.lora_utils.extract_lora_metadata(),
-                 intermediate_tensors=None,
-                 is_first_rank=self.is_first_rank,
-                 is_last_rank=self.is_last_rank,
-                 dp_size=self.dp_size,
-                 collect_expert_indices=False,
-                 max_logprobs=self.model_config.max_logprobs,
-                 logprobs_mode=self.model_config.logprobs_mode,
-                 continue_decode_eos_check_interval=self.
-                 continue_decode_eos_check_interval,
-             )
-
-        self.rng_params_for_sampling = final_rng
-        self.kv_caches = final_kv_caches
-
-        (continued_token_ids, continued_logprobs, _, _,
-         _) = _process_continue_decode_outputs(
-             generated_tokens=generated_tokens,
-             actual_steps=final_state.step_counter,
-             req_ids=req_ids,
-             eos_token_id=self.eos_token_id,
-             indices_selector=tokens_indices_selector,
-             logprobs_tensors=logprobs_tensors,
-             requests=self.requests,
-             input_batch=self.input_batch,
-             max_num_reqs=self.max_num_reqs,
-             max_model_len=self.max_model_len,
-             attn_metadata=attn_metadata,
-         )
-
-        sampled = output.sampled_token_ids
-        init_lens = [len(s) for s in sampled]
-        for i, extra in enumerate(continued_token_ids):
-            if extra and i < len(sampled) and sampled[i]:
-                sampled[i].extend(extra)
-
-        if output.logprobs is not None and continued_logprobs is not None:
-            init_lp = output.logprobs
-            cont_lp = continued_logprobs
-            merged_ids = []
-            merged_vals = []
-            merged_ranks = []
-            for i, init_len in enumerate(init_lens):
-                p_start = (init_lp.cu_num_generated_tokens[i]
-                           if init_lp.cu_num_generated_tokens is not None else i)
-                p_end = p_start + init_len
-                if p_end > p_start:
-                    merged_ids.append(init_lp.logprob_token_ids[p_start:p_end])
-                    merged_vals.append(init_lp.logprobs[p_start:p_end])
-                    merged_ranks.append(
-                        init_lp.sampled_token_ranks[p_start:p_end])
-                extra_len = len(sampled[i]) - init_len
-                if extra_len > 0:
-                    c_start = (
-                        cont_lp.cu_num_generated_tokens[i]
-                        if cont_lp.cu_num_generated_tokens is not None else i)
-                    c_end = c_start + extra_len
-                    merged_ids.append(cont_lp.logprob_token_ids[c_start:c_end])
-                    merged_vals.append(cont_lp.logprobs[c_start:c_end])
-                    merged_ranks.append(
-                        cont_lp.sampled_token_ranks[c_start:c_end])
-            if merged_ids:
-                output.logprobs = LogprobsLists(
-                    logprob_token_ids=np.concatenate(merged_ids, axis=0),
-                    logprobs=np.concatenate(merged_vals, axis=0),
-                    sampled_token_ranks=np.concatenate(merged_ranks, axis=0),
-                    cu_num_generated_tokens=[0] +
-                    list(np.cumsum([len(x) for x in sampled])),
-                )
+        for tokens, window_tokens in zip(output.sampled_token_ids,
+                                         window.sampled_token_ids):
+            tokens.extend(window_tokens)
+        if output.logprobs is not None and window.logprobs is not None:
+            output.logprobs = _append_window_logprobs(output.logprobs,
+                                                      window.logprobs,
+                                                      num_reqs)
         return output
 
     def _get_min_remaining_slots(self) -> int:
@@ -2310,9 +2241,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 sampling_metadata=tpu_sampling_metadata,
                 key=rejection_rng,
             )
-
-        if self._cd_chain_pending:
-            self._cd_chain_next_tokens = next_tokens
 
         logits = logits.astype(jnp.float32)
         if full_logits is not None:
