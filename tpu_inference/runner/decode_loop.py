@@ -104,12 +104,19 @@ def _finished_row_attention_inputs(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Attention inputs that give each finished row a one-token window.
 
-    A row that hit EOS stays in the batch until the window ends, and would
+    A row that hit EOS stays in the batch until the loop ends, and would
     otherwise re-read its whole KV cache on every step. Here it gets
-    seq_len 1 and its first page becomes page 0. vLLM reserves page 0 as the
-    null block, so the row's discarded KV write never lands in a live page,
-    even if the host later continues the request. Active rows are unchanged.
+    seq_len 1, position 0, and its first page becomes page 0. vLLM reserves
+    page 0 as the null block (with DP, each rank has its own block pool, so
+    this is the rank-local page 0), so the row's discarded KV write never
+    lands in a live page, even if the host later continues the request.
+    Without this, that write overwrote the KV of the row's last real token
+    with the padding token's KV on every step. Active rows are unchanged.
     Padding rows keep seq_len 0, so their page 0 entry is never read.
+
+    The saving grows with context length, since the RPA decode kernel reads
+    KV in fixed-size chunks. Measured on Qwen3-0.6B GRPO rollouts (DP 128,
+    ~4.5K-token completions, EOS check off): -0.38 s per RL step.
 
     Returns (positions, seq_lens, block_tables) for the attention metadata.
     """
@@ -172,10 +179,14 @@ def _decode_core_impl(
         has_logprobs, logprobs_mode)
 
     # See `_finished_row_attention_inputs`. The loop carry keeps the real
-    # positions and seq_lens for the host. Context-parallel meshes split each
-    # sequence's KV across ranks, so they keep the plain inputs.
+    # positions and seq_lens for the host. With an EOS check interval of 1
+    # (the default) the loop exits right after the first EOS, so no step ever
+    # runs with a finished row; skip the extra ops then. Context-parallel
+    # meshes split each sequence's KV across ranks, so they keep the plain
+    # inputs.
     mesh_shape = getattr(mesh, "shape", None) or {}
-    skip_finished_attn = (getattr(block_tables, "ndim", 0) >= 1
+    skip_finished_attn = (continue_decode_eos_check_interval != 1
+                          and getattr(block_tables, "ndim", 0) >= 1
                           and block_tables.size % seq_lens.shape[0] == 0
                           and mesh_shape.get("dcp", 1) == 1
                           and mesh_shape.get("pcp", 1) == 1)
