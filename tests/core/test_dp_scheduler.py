@@ -30,7 +30,7 @@ from vllm.v1.outputs import LogprobsLists, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
 from tpu_inference.core.sched.dp_scheduler import (
-    DPScheduler, DPSchedulerOutput, SchedulerCommand,
+    DPScheduler, DPSchedulerOutput, SchedulerCommand, SchedulerWorkerError,
     _scheduler_worker_process, update_vllm_config_for_dp_scheduler)
 
 
@@ -487,7 +487,10 @@ class TestDPScheduler:
 
         def get_result(rank, command=None):
             log.append(("get", rank, command))
-            return (results or {}).get(command)
+            result = (results or {}).get(command)
+            if isinstance(result, Exception):
+                raise result  # as _get_result does for a worker error
+            return result
 
         scheduler.input_conns = [pipe(i) for i in range(scheduler.dp_size)]
         scheduler._get_result = MagicMock(side_effect=get_result)
@@ -550,6 +553,50 @@ class TestDPScheduler:
             ("send", 0, finish, (["req-0"], RequestStatus.FINISHED_ABORTED)),
             ("get", 0, finish),
         ]
+
+    def test_failed_held_add_raises_from_next_command(
+            self, mock_vllm_config, mock_kv_cache_config,
+            mock_structured_output_manager):
+        """If a rank fails to add its held requests (or is dead), the next
+        command raises the error before sending anything else, and the
+        requests are not held for a retry."""
+        scheduler = self._create_scheduler(mock_vllm_config,
+                                           mock_kv_cache_config,
+                                           mock_structured_output_manager)
+        scheduler._routing_policy = DPScheduler.RoutingPolicy.ROUND_ROBIN
+        scheduler._batch_prefills = False
+        add = SchedulerCommand.ADD_REQUESTS
+        error = SchedulerWorkerError(0, "add failed")
+        log = self._record_ipc(scheduler, {add: error})
+
+        req = SimpleNamespace(request_id="req-0")
+        scheduler.add_request(req)
+        with pytest.raises(SchedulerWorkerError):
+            scheduler.get_num_unfinished_requests()
+
+        assert log == [("send", 0, add, [req]), ("get", 0, add)]
+        assert not scheduler._unsent_requests
+
+    def test_least_loaded_sends_each_add_at_once(
+            self, mock_vllm_config, mock_kv_cache_config,
+            mock_structured_output_manager):
+        """Only round robin holds requests. least_loaded reads rank state to
+        route, so add_request() still sends each request and waits for its
+        ack."""
+        scheduler = self._create_scheduler(mock_vllm_config,
+                                           mock_kv_cache_config,
+                                           mock_structured_output_manager)
+        scheduler._routing_policy = DPScheduler.RoutingPolicy.LEAST_LOADED
+        scheduler._batch_prefills = False
+        scheduler._find_best_rank_for_request = MagicMock(return_value=1)
+        log = self._record_ipc(scheduler)
+
+        req = SimpleNamespace(request_id="req-0")
+        scheduler.add_request(req)
+
+        add = SchedulerCommand.ADD_REQUEST
+        assert log == [("send", 1, add, req), ("get", 1, add)]
+        assert not scheduler._unsent_requests
 
     def test_shutdown_drops_held_requests(self, mock_vllm_config,
                                           mock_kv_cache_config,
