@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -131,3 +132,26 @@ class TestContinueDecodeSchedulerPatch:
             assert request.num_computed_tokens == 10
             # The flag must not leak past the call.
             assert scheduler._cd_stale_in_flight is False
+
+    @pytest.mark.parametrize("after_prefill, expected", [(False, 7),
+                                                         (True, 8)])
+    def test_lookahead_covers_window_after_prefill(self, monkeypatch,
+                                                   after_prefill, expected):
+        """A window of max_decode_steps needs max_decode_steps - 1 lookahead
+        slots. A window right after prefill also consumes the token sampled
+        in that step, which was not scheduled, so it needs one more."""
+        from vllm.v1.core.sched.scheduler import Scheduler
+
+        def fake_init(scheduler_self, vllm_config, *args, **kwargs):
+            scheduler_self.num_lookahead_tokens = 0
+
+        monkeypatch.setattr(Scheduler, "__init__", fake_init)
+        monkeypatch.setenv("ENABLE_CONTINUE_DECODE_AFTER_PREFILL",
+                           "1" if after_prefill else "0")
+        patch_vllm_scheduler_for_continue_decode()
+
+        scheduler = Scheduler.__new__(Scheduler)
+        Scheduler.__init__(
+            scheduler,
+            SimpleNamespace(additional_config={"max_decode_steps": 8}))
+        assert scheduler.num_lookahead_tokens == expected

@@ -157,6 +157,18 @@ def test_moe_hierarchical_dispatch(monkeypatch: pytest.MonkeyPatch):
     assert envs.MOE_HIERARCHICAL_DISPATCH is False
 
 
+def test_enable_continue_decode_after_prefill(monkeypatch: pytest.MonkeyPatch):
+    """ENABLE_CONTINUE_DECODE_AFTER_PREFILL is opt-in: off unless asked for."""
+    monkeypatch.delenv("ENABLE_CONTINUE_DECODE_AFTER_PREFILL", raising=False)
+    assert envs.ENABLE_CONTINUE_DECODE_AFTER_PREFILL is False
+
+    monkeypatch.setenv("ENABLE_CONTINUE_DECODE_AFTER_PREFILL", "1")
+    assert envs.ENABLE_CONTINUE_DECODE_AFTER_PREFILL is True
+
+    monkeypatch.setenv("ENABLE_CONTINUE_DECODE_AFTER_PREFILL", "0")
+    assert envs.ENABLE_CONTINUE_DECODE_AFTER_PREFILL is False
+
+
 def test_dp_sched_routing(monkeypatch: pytest.MonkeyPatch):
     """DP_SCHED_ROUTING defaults to least_loaded and only accepts known policies."""
     monkeypatch.delenv("DP_SCHED_ROUTING", raising=False)
