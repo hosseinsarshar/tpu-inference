@@ -146,7 +146,9 @@ def _decode_core_impl(
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
             mamba_state_indices=mamba_state_indices,
-            # The loop runs one query token per row: (n, n, n) on every rank.
+            # Every row feeds one query token per step, and the runner only
+            # enters this loop when every request is a decode, so
+            # request_distribution is (n, n, n) on every rank.
             decode_only=True,
         )
         shared_attn_metadata = SharedAttentionMetadata(
