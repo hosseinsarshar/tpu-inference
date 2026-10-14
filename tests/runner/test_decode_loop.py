@@ -533,8 +533,9 @@ def test_continue_decode_checks_sampling_support_once():
 
     def mock_model_fn(state, kv_caches, current_tokens, attn_metadata, *args,
                       **kwargs):
-        hidden_states = attn_metadata.input_positions.astype(
-            jnp.float32)[:, None, None]
+        hidden_states = attn_metadata.input_positions.astype(jnp.float32)[:,
+                                                                          None,
+                                                                          None]
         return kv_caches, hidden_states, None, None
 
     def mock_compute_logits_fn(state, hidden_states, _):
