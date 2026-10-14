@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -22,8 +24,9 @@ from tpu_inference.layers.common.sharding import MESH_AXIS_NAMES
 from tpu_inference.layers.jax.sample.sampling_metadata import \
     TPUSupportedSamplingMetadata
 from tpu_inference.runner.decode_loop import (TpuSamplingState,
-                                              _decode_core_impl, _split_rngs,
-                                              _update_loop_state,
+                                              _decode_core_impl,
+                                              _finished_row_attention_inputs,
+                                              _split_rngs, _update_loop_state,
                                               continue_decode)
 
 
@@ -691,3 +694,220 @@ def test_decode_loop_processed_modes_use_sample_output(logprobs_mode):
     raw_top, processed_top = 7, 13
     top1 = _run_decode_core_for_logprobs(logprobs_mode, raw_top, processed_top)
     assert np.all(top1 == processed_top)
+
+
+def test_finished_row_attention_inputs_single_rank():
+    # Row 1 has finished; rows 0 and 2 are still active.
+    active_mask = jnp.array([True, False, True])
+    positions = jnp.array([10, 20, 30], dtype=jnp.int32)
+    seq_lens = jnp.array([11, 21, 31], dtype=jnp.int32)
+    block_tables = jnp.arange(1, 13, dtype=jnp.int32).reshape(3, 4)
+
+    pos, lens, tables = _finished_row_attention_inputs(active_mask,
+                                                       positions,
+                                                       seq_lens,
+                                                       block_tables,
+                                                       dp_size=1,
+                                                       pad_len=0)
+
+    # The finished row attends to one token in page 0 (vLLM's null block).
+    assert np.array_equal(pos, [10, 0, 30])
+    assert np.array_equal(lens, [11, 1, 31])
+    assert np.array_equal(tables,
+                          [[1, 2, 3, 4], [0, 6, 7, 8], [9, 10, 11, 12]])
+
+    # Flattened block tables keep their shape.
+    _, _, flat_tables = _finished_row_attention_inputs(active_mask,
+                                                       positions,
+                                                       seq_lens,
+                                                       block_tables.ravel(),
+                                                       dp_size=1,
+                                                       pad_len=0)
+    assert flat_tables.shape == (12, )
+    assert np.array_equal(flat_tables, np.asarray(tables).ravel())
+
+
+def test_finished_row_attention_inputs_dp_padding():
+    # 2 DP ranks, 2 tokens and 3 seq rows per rank; the last seq row of each
+    # rank is padding (same layout as test_update_loop_state_dp_padding).
+    # The second request of rank 1 has finished.
+    active_mask = jnp.array([True, True, True, False])
+    positions = jnp.array([10, 20, 30, 40], dtype=jnp.int32)
+    seq_lens = jnp.array([11, 21, 0, 31, 41, 0], dtype=jnp.int32)
+    block_tables = jnp.arange(1, 13, dtype=jnp.int32).reshape(6, 2)
+
+    pos, lens, tables = _finished_row_attention_inputs(active_mask,
+                                                       positions,
+                                                       seq_lens,
+                                                       block_tables,
+                                                       dp_size=2,
+                                                       pad_len=1)
+
+    assert np.array_equal(pos, [10, 20, 30, 0])
+    # Padding rows keep seq_len 0, so their first page is never read.
+    assert np.array_equal(lens, [11, 21, 0, 31, 1, 0])
+    assert np.array_equal(np.asarray(tables)[:, 0], [1, 3, 0, 7, 0, 0])
+    assert np.array_equal(np.asarray(tables)[:, 1], block_tables[:, 1])
+
+
+def _decode_core_kwargs(model_fn, compute_logits_fn, sample_fn, *, mesh,
+                        continue_decode_eos_check_interval):
+    """Fused-loop inputs for 4 steps over 2 rows plus 1 padding seq row.
+
+    Row 0 starts at position 4 in page 7, row 1 at position 0 in page 11.
+    """
+    step_rngs, _ = _split_rngs(jax.random.PRNGKey(0), 4, 4)
+    return dict(
+        state={},
+        kv_caches=[jnp.zeros((2, 10))],
+        step_rngs=step_rngs,
+        sampling_metadata=None,
+        inputs_embeds=None,
+        lora_metadata=None,
+        intermediate_tensors=None,
+        block_tables=jnp.array([[7, 8], [11, 12], [0, 0]], dtype=jnp.int32),
+        query_start_loc=jnp.array([0, 1, 2, 2], dtype=jnp.int32),
+        request_distribution=jnp.array([2, 2, 2], dtype=jnp.int32),
+        mamba_state_indices=None,
+        current_tokens=jnp.array([10, 20], dtype=jnp.int32),
+        active_mask=jnp.array([True, True], dtype=jnp.bool_),
+        input_positions=jnp.array([4, 0], dtype=jnp.int32),
+        seq_lens=jnp.array([5, 1, 0], dtype=jnp.int32),
+        model_fn=model_fn,
+        compute_logits_fn=compute_logits_fn,
+        sample_fn=sample_fn,
+        mesh=mesh,
+        max_decode_steps=4,
+        static_max_decode_steps=4,
+        eos_token_id=(99, ),
+        padding_token_id=-1,
+        dp_size=1,
+        pad_len=1,
+        has_experts=True,
+        expert_shape=(3, 2),
+        expert_dtype=jnp.int32,
+        layer_name_to_kvcache_index=(),
+        is_first_rank=True,
+        is_last_rank=True,
+        max_logprobs=0,
+        logprobs_mode="raw",
+        continue_decode_eos_check_interval=continue_decode_eos_check_interval,
+    )
+
+
+def _run_decode_core_seen_attention(mesh=None,
+                                    continue_decode_eos_check_interval=-1):
+    """Run the fused loop where row 1 samples EOS at step 1.
+
+    The stub model reports the (positions, seq_lens, first pages) it sees as
+    its routed-expert indices, which the loop records for every row on every
+    step. Returns that record and the loop's final positions and seq_lens.
+    """
+
+    def mock_model_fn(state, kv_caches, current_tokens, attn_metadata, *args,
+                      **kwargs):
+        seen = jnp.stack([
+            attn_metadata.input_positions,
+            attn_metadata.seq_lens[:2],
+            attn_metadata.block_tables[:2, 0],
+        ])
+        hidden_states = attn_metadata.input_positions.astype(jnp.float32)[:,
+                                                                          None,
+                                                                          None]
+        return kv_caches, hidden_states, None, seen
+
+    def mock_compute_logits_fn(state, hidden_states, _):
+        return jnp.zeros((2, 100)).at[:, 0].set(hidden_states[:, 0, 0])
+
+    def mock_sample_fn(rng, mesh, logits, sampling_metadata, **kwargs):
+        # Row 1 samples EOS at position 1; row 0 never does.
+        pos = logits[:, 0].astype(jnp.int32)
+        return jnp.where((pos == 1) & (jnp.arange(2) == 1), 99, 42), None
+
+    outputs = _decode_core_impl(**_decode_core_kwargs(
+        mock_model_fn,
+        mock_compute_logits_fn,
+        mock_sample_fn,
+        mesh=mesh,
+        continue_decode_eos_check_interval=continue_decode_eos_check_interval))
+    _, _, active_mask, positions, seq_lens, _, _, seen = outputs[:8]
+    assert np.array_equal(active_mask, [True, False])
+    return np.asarray(seen), positions, seq_lens
+
+
+def test_continue_decode_finished_rows_attend_to_one_token():
+    seen, positions, seq_lens = _run_decode_core_seen_attention()
+
+    # seen[step] = [positions, seq_lens, first pages], one column per row.
+    # Row 1 hits EOS at step 1; from step 2 on it attends to one token in
+    # page 0. Row 0 is unchanged.
+    expected = np.array([
+        [[4, 0], [5, 1], [7, 11]],
+        [[5, 1], [6, 2], [7, 11]],
+        [[6, 0], [7, 1], [7, 0]],
+        [[7, 0], [8, 1], [7, 0]],
+    ])
+    assert np.array_equal(seen, expected)
+    # The loop carry and the final state keep the real values.
+    assert np.array_equal(positions, [8, 1])
+    assert np.array_equal(seq_lens, [9, 2, 0])
+
+
+def test_continue_decode_context_parallel_keeps_finished_rows():
+    # Context-parallel meshes split each sequence's KV across ranks, so
+    # finished rows keep their plain attention inputs there.
+    seen, _, _ = _run_decode_core_seen_attention(mesh=SimpleNamespace(shape={
+        "dcp": 2,
+        "pcp": 1
+    }))
+    assert np.array_equal(seen[2:, :, 1], [[1, 2, 11], [1, 2, 11]])
+
+
+def _while_body_primitives(jaxpr):
+    """Primitive names inside the while_loop body, including nested jits."""
+
+    def names(jaxpr):
+        found = set()
+        for eqn in jaxpr.eqns:
+            found.add(eqn.primitive.name)
+            for param in eqn.params.values():
+                for sub in param if isinstance(param,
+                                               (list, tuple)) else [param]:
+                    sub = getattr(sub, "jaxpr", sub)
+                    if hasattr(sub, "eqns"):
+                        found |= names(sub)
+        return found
+
+    (loop, ) = [eqn for eqn in jaxpr.eqns if eqn.primitive.name == "while"]
+    return names(loop.params["body_jaxpr"].jaxpr)
+
+
+def test_continue_decode_default_interval_skips_finished_row_inputs():
+    """With an EOS check interval of 1 the loop exits right after the first
+    EOS, so no step runs with a finished row. The loop must then build the
+    attention inputs exactly as before (no `min` for the one-token window).
+    """
+
+    def mock_model_fn(state, kv_caches, current_tokens, attn_metadata, *args,
+                      **kwargs):
+        return kv_caches, jnp.zeros((2, 1, 1)), None, jnp.zeros((3, 2),
+                                                                jnp.int32)
+
+    def mock_compute_logits_fn(state, hidden_states, _):
+        return jnp.zeros((2, 100))
+
+    def mock_sample_fn(rng, mesh, logits, sampling_metadata, **kwargs):
+        return jnp.zeros((2, ), dtype=jnp.int32), None
+
+    def body_primitives(interval):
+        kwargs = _decode_core_kwargs(
+            mock_model_fn,
+            mock_compute_logits_fn,
+            mock_sample_fn,
+            mesh=None,
+            continue_decode_eos_check_interval=interval)
+        jaxpr = jax.make_jaxpr(lambda: _decode_core_impl(**kwargs))().jaxpr
+        return _while_body_primitives(jaxpr)
+
+    assert "min" in body_primitives(-1)
+    assert "min" not in body_primitives(1)
