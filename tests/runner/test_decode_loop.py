@@ -691,3 +691,63 @@ def test_decode_loop_processed_modes_use_sample_output(logprobs_mode):
     raw_top, processed_top = 7, 13
     top1 = _run_decode_core_for_logprobs(logprobs_mode, raw_top, processed_top)
     assert np.all(top1 == processed_top)
+
+
+def test_continue_decode_marks_attention_metadata_decode_only():
+    """Every row feeds one query token per step, so the loop marks its
+    attention metadata decode-only. The RPA v3 kernel then skips its empty
+    prefill and mixed launches.
+    """
+    batch_size = 2
+    seen_decode_only = []
+
+    def mock_model_fn(state, kv_caches, current_tokens, attn_metadata, *args,
+                      **kwargs):
+        # decode_only is static, so this runs at trace time.
+        seen_decode_only.append(attn_metadata.decode_only)
+        return kv_caches, jnp.zeros((batch_size, 1, 1)), None, None
+
+    def mock_compute_logits_fn(state, hidden_states, _):
+        return jnp.zeros((batch_size, 100))
+
+    def mock_sample_fn(rng, mesh, logits, sampling_metadata, **kwargs):
+        return jnp.zeros((batch_size, ), dtype=jnp.int32), None
+
+    step_rngs, _ = _split_rngs(jax.random.PRNGKey(0), 2, 2)
+    _decode_core_impl(
+        state={},
+        kv_caches=[jnp.zeros((2, 10))],
+        step_rngs=step_rngs,
+        sampling_metadata=None,
+        inputs_embeds=None,
+        lora_metadata=None,
+        intermediate_tensors=None,
+        block_tables=jnp.zeros((2, 16), dtype=jnp.int32),
+        query_start_loc=jnp.array([0, 1, 2], dtype=jnp.int32),
+        request_distribution=jnp.array([2, 2, 2], dtype=jnp.int32),
+        mamba_state_indices=None,
+        current_tokens=jnp.array([10, 20], dtype=jnp.int32),
+        active_mask=jnp.array([True, True], dtype=jnp.bool_),
+        input_positions=jnp.array([0, 0], dtype=jnp.int32),
+        seq_lens=jnp.array([1, 1], dtype=jnp.int32),
+        model_fn=mock_model_fn,
+        compute_logits_fn=mock_compute_logits_fn,
+        sample_fn=mock_sample_fn,
+        mesh=None,
+        max_decode_steps=2,
+        static_max_decode_steps=2,
+        eos_token_id=(99, ),
+        padding_token_id=-1,
+        dp_size=1,
+        pad_len=0,
+        has_experts=False,
+        expert_shape=None,
+        expert_dtype=None,
+        layer_name_to_kvcache_index=(),
+        is_first_rank=True,
+        is_last_rank=True,
+        max_logprobs=0,
+        logprobs_mode="raw",
+        continue_decode_eos_check_interval=1,
+    )
+    assert seen_decode_only and all(seen_decode_only)

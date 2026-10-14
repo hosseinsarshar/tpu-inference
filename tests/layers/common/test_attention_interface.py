@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 from unittest.mock import MagicMock
 
 import jax
@@ -556,7 +557,7 @@ class TestSegmentIdsFromCuSeqlens:
 # ---- Tests for the RPA v3 block-size env overrides ----
 
 
-def _capture_rpa_kwargs(monkeypatch, mesh, head_dim=128):
+def _capture_rpa_kwargs(monkeypatch, mesh, head_dim=128, decode_only=False):
     """Call `attention` with a stubbed RPA kernel and return its kwargs.
 
     Deliberately does not reuse `_test_attention`: that helper installs its own
@@ -591,6 +592,7 @@ def _capture_rpa_kwargs(monkeypatch, mesh, head_dim=128):
         seq_lens=jnp.array([5, 5, 0, 0], dtype=jnp.int32),
         query_start_loc=jnp.array([0, 5, 10, 10, 10], dtype=jnp.int32),
         request_distribution=jnp.array([0, 0, NUM_SEQS], dtype=jnp.int32),
+        decode_only=decode_only,
     )
     shared_attention_metadata = SharedAttentionMetadata(
         input_positions=jnp.arange(TOTAL_TOKENS, dtype=jnp.int32),
@@ -654,3 +656,44 @@ def test_rpa_block_sizes_not_forwarded_to_batched_kernel(monkeypatch, mesh):
     kwargs = _capture_rpa_kwargs(monkeypatch, mesh)
     assert "d_block_sizes" not in kwargs
     assert "decode_query_size" in kwargs
+
+
+# ---- Tests for the decode-only flag ----
+
+
+def test_attention_metadata_decode_only_is_static():
+    """decode_only defaults to False and is a static pytree field: it is not a
+    traced leaf, but it is part of the treedef and so of every jit cache key.
+    """
+    md = AttentionMetadata(
+        input_positions=jnp.arange(4, dtype=jnp.int32),
+        block_tables=jnp.zeros((8, ), dtype=jnp.int32),
+        seq_lens=jnp.ones((4, ), dtype=jnp.int32),
+        query_start_loc=jnp.arange(5, dtype=jnp.int32),
+        request_distribution=jnp.array([4, 4, 4], dtype=jnp.int32),
+    )
+    assert md.decode_only is False
+    decode_md = dataclasses.replace(md, decode_only=True)
+
+    leaves, treedef = jax.tree_util.tree_flatten(md)
+    decode_leaves, decode_treedef = jax.tree_util.tree_flatten(decode_md)
+    assert len(leaves) == len(decode_leaves)
+    assert treedef != decode_treedef
+    assert jax.tree_util.tree_unflatten(decode_treedef,
+                                        decode_leaves).decode_only is True
+
+
+def test_decode_only_forwarded_to_v3_kernel(monkeypatch, mesh):
+    """Decode-only metadata (set by the fused decode loop) makes the v3 kernel
+    skip its empty prefill and mixed launches. Other calls are unchanged."""
+    monkeypatch.delenv("USE_BATCHED_RPA_KERNEL", raising=False)
+    kwargs = _capture_rpa_kwargs(monkeypatch, mesh, decode_only=True)
+    assert kwargs["decode_only"] is True
+    assert "decode_only" not in _capture_rpa_kwargs(monkeypatch, mesh)
+
+
+def test_decode_only_not_forwarded_to_batched_kernel(monkeypatch, mesh):
+    """The experimental batched kernel has no decode_only kwarg."""
+    monkeypatch.setenv("USE_BATCHED_RPA_KERNEL", "1")
+    kwargs = _capture_rpa_kwargs(monkeypatch, mesh, decode_only=True)
+    assert "decode_only" not in kwargs
